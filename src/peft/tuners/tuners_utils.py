@@ -33,6 +33,7 @@ from peft.utils import INCLUDE_LINEAR_LAYERS_SHORTHAND
 
 from ..config import PeftConfig
 from ..utils import ModulesToSaveWrapper, _get_submodules
+from ._buffer_dict import BufferDict
 
 
 logger = logging.getLogger(__name__)
@@ -137,7 +138,7 @@ class BaseTuner(nn.Module, ABC):
             The model configuration object, it should be a dictionary of `str` to `Any` objects.
         targeted_module_names (`list[str]`):
             The list of module names that were actually adapted. Can be useful to inspect if you want to quickly
-            double-check that the `config.target_modules` where specified correctly.
+            double-check that the `config.target_modules` were specified correctly.
     """
 
     def __init__(self, model, peft_config: Union[PeftConfig, dict[str, PeftConfig]], adapter_name: str) -> None:
@@ -161,7 +162,8 @@ class BaseTuner(nn.Module, ABC):
                 # user is adding a dict of PeftConfigs
                 self.peft_config.update(peft_config)
 
-        self.active_adapter = adapter_name
+        self.active_adapter: str | list[str] = adapter_name
+        self._pre_injection_hook(self.model, self.peft_config[adapter_name], adapter_name)
         self.inject_adapter(self.model, adapter_name)
 
         # Copy the peft_config in the injected model.
@@ -176,6 +178,21 @@ class BaseTuner(nn.Module, ABC):
 
     def forward(self, *args: Any, **kwargs: Any):
         return self.model.forward(*args, **kwargs)
+
+    def _pre_injection_hook(self, model: nn.Module, config: PeftConfig, adapter_name: str) -> None:
+        r"""
+        A hook to be called before the adapter is injected into the model. This method can be overridden by child
+        classes to perform any pre-injection operations.
+
+        Args:
+            model (`nn.Module`):
+                The model to be adapted.
+            config (`PeftConfig`):
+                The adapter config.
+            adapter_name (`str`):
+                The adapter name.
+        """
+        pass
 
     @abstractmethod
     def _prepare_adapter_config(self, peft_config: PeftConfig, model_config: dict) -> PeftConfig:
@@ -265,6 +282,20 @@ class BaseTuner(nn.Module, ABC):
         """
         ...
 
+    @abstractmethod
+    def disable_adapter_layers(self) -> None:
+        """
+        Disable all adapters in-place.
+        """
+        ...
+
+    @abstractmethod
+    def enable_adapter_layers(self) -> None:
+        """
+        Enable all adapters in-place
+        """
+        ...
+
     def _check_new_adapter_config(self, config: PeftConfig) -> None:
         """
         A helper method to check the config when a new adapter is being added.
@@ -274,6 +305,49 @@ class BaseTuner(nn.Module, ABC):
         """
         pass
 
+    def _cast_adapter_dtype(self, adapter_name: str, autocast_adapter_dtype: bool = True) -> None:
+        """
+        A helper method to cast the adapter weights to the correct dtype.
+
+        Currently, this only upcasts float16 and bfloat16 to float32.
+
+        Args:
+            adapter_name (`str`):
+                The adapter name.
+            autocast_adapter_dtype (`bool`, *optional*):
+                Whether to autocast the adapter dtype. Defaults to `True`.
+
+        """
+        if not autocast_adapter_dtype:
+            return
+
+        dtypes_to_convert_to_fp32 = {torch.float16, torch.bfloat16}
+
+        for module in self.model.modules():
+            if not isinstance(module, BaseTunerLayer):
+                continue
+
+            for submodule in module.modules():
+                if not isinstance(submodule, (nn.ModuleDict, nn.ParameterDict, BufferDict)):
+                    continue
+
+                if adapter_name not in submodule:
+                    continue
+
+                if isinstance(submodule[adapter_name], nn.Parameter):
+                    if submodule[adapter_name].dtype in dtypes_to_convert_to_fp32:
+                        submodule[adapter_name].data = submodule[adapter_name].data.to(torch.float32)
+                    continue
+
+                if isinstance(submodule[adapter_name], torch.Tensor):  # e.g. from a BufferDict
+                    if submodule[adapter_name].dtype in dtypes_to_convert_to_fp32:
+                        submodule[adapter_name] = submodule[adapter_name].to(torch.float32)
+                    continue
+
+                for param in submodule[adapter_name].parameters():
+                    if param.dtype in dtypes_to_convert_to_fp32:
+                        param.data = param.data.to(torch.float32)
+
     def _check_merge_allowed(self):
         """Helper method to check whether the adapter can be merged.
 
@@ -281,7 +355,7 @@ class BaseTuner(nn.Module, ABC):
         """
         pass
 
-    def inject_adapter(self, model: nn.Module, adapter_name: str):
+    def inject_adapter(self, model: nn.Module, adapter_name: str, autocast_adapter_dtype: bool = True) -> None:
         r"""
         Creates adapter layers and replaces the target modules with the adapter layers. This method is called under the
         hood by `peft.mapping.get_peft_model` if a non-prompt tuning adapter class is passed.
@@ -293,6 +367,8 @@ class BaseTuner(nn.Module, ABC):
                 The model to be tuned.
             adapter_name (`str`):
                 The adapter name.
+            autocast_adapter_dtype (`bool`, *optional*):
+                Whether to autocast the adapter dtype. Defaults to `True`.
         """
         peft_config = self.peft_config[adapter_name]
         # Note: If possible, all checks should be performed *at the start of this method*.
@@ -347,6 +423,10 @@ class BaseTuner(nn.Module, ABC):
                 f"Please check the target modules and try again."
             )
 
+        # It's important to set the adapter here (again), because otherwise it can happen that if a 2nd adapter is
+        # added, and it targets different layer(s) than the first adapter (which is active), then those different
+        # layers will be activated, which we don't want.
+        self.set_adapter(self.active_adapters)
         self._mark_only_adapters_as_trainable(model)
 
         if self.peft_config[adapter_name].inference_mode:
@@ -415,9 +495,9 @@ class BaseTunerLayer(ABC):
     active_adapter = None
 
     # All names of layers that may contain adapter (trainable) weights
-    adapter_layer_names: tuple[str] = ()
+    adapter_layer_names: tuple[str, ...] = ()
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names: tuple[str] = ()
+    other_param_names: tuple[str, ...] = ()
 
     # indicates whether all adapters should be disabled
     _disable_adapters: bool = False
@@ -477,9 +557,19 @@ class BaseTunerLayer(ABC):
         return self._disable_adapters
 
     @property
-    def active_adapter(self) -> str:
+    def active_adapter(self) -> str | list[str]:
         # use a property to ensure that active_adapter is not set directly, instead use the set_adapter method
         return self._active_adapter
+
+    def _get_available_adapters(self) -> set[str]:
+        """Return all adapter names that can be found on this module."""
+        adapters = set()
+        for layer_name in self.adapter_layer_names:
+            module = getattr(self, layer_name)
+            if not isinstance(module, (nn.ModuleDict, nn.ParameterDict)):
+                continue
+            adapters.update(set(module.keys()))
+        return adapters
 
     @property
     def active_adapters(self):
@@ -584,6 +674,36 @@ class BaseTunerLayer(ABC):
                         f"{new_active_adapter}."
                     )
                     self.set_adapter(remaining_adapters[0])
+
+    def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
+        """
+        Move the adapter of the given name to the device of the base layer.
+        """
+        if device is None:
+            # check weight and qweight (for GPTQ)
+            for weight_name in ("weight", "qweight"):
+                weight = getattr(self.get_base_layer(), weight_name, None)
+                if weight is not None:
+                    device = weight.device
+                    dtype = weight.dtype
+                    break
+            else:
+                # no break encountered: could not determine the device
+                return
+
+        # loop through all potential adapter layers and move them to the device of the base layer; be careful to only
+        # move this specific adapter to the device, as the other adapters could be on different devices
+        # see #1639
+        for adapter_layer_name in self.adapter_layer_names + self.other_param_names:
+            adapter_layer = getattr(self, adapter_layer_name, None)
+            if not isinstance(adapter_layer, (nn.ModuleDict, nn.ParameterDict, BufferDict)):
+                continue
+            if adapter_name not in adapter_layer:
+                continue
+            if weight.dtype.is_floating_point or weight.dtype.is_complex:
+                adapter_layer[adapter_name] = adapter_layer[adapter_name].to(device, dtype=dtype)
+            else:
+                adapter_layer[adapter_name] = adapter_layer[adapter_name].to(device)
 
 
 def check_target_module_exists(config, key: str) -> bool | re.Match[str] | None:
@@ -697,6 +817,8 @@ def check_adapters_to_merge(module: BaseTunerLayer, adapter_names: Optional[list
     """
     if adapter_names is None:
         adapter_names = module.active_adapters
+    if isinstance(adapter_names, str):
+        raise ValueError(f"adapter_names should be a list of strings, got {adapter_names!r}.")
 
     if module.merged:
         merged_adapters = set(module.merged_adapters)

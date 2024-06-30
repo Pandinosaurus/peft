@@ -97,8 +97,6 @@ class PeftMixedModel(PushToHubMixin, torch.nn.Module):
     Example:
 
     ```py
-    >>> from peft import get_peft_model
-
     >>> base_model = ...  # load the base model, e.g. from transformers
     >>> peft_model = PeftMixedModel.from_pretrained(base_model, path_to_adapter1, "adapter1").eval()
     >>> peft_model.load_adapter(path_to_adapter2, "adapter2")
@@ -310,6 +308,12 @@ class PeftMixedModel(PushToHubMixin, torch.nn.Module):
         model.
         """
         return self.base_model.unload(*args, **kwargs)
+
+    def get_layer_status(self):
+        raise TypeError(f"get_layer_status is not supported for {self.__class__.__name__}.")
+
+    def get_model_status(self):
+        raise TypeError(f"get_model_status is not supported for {self.__class__.__name__}.")
 
     @classmethod
     def _split_kwargs(cls, kwargs: dict[str, Any]):
