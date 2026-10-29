@@ -11,18 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import importlib
+import math
 import warnings
 from typing import Any, Optional
 
 import torch
-import torch.nn as nn
-import torch.nn.init as init
+from torch import nn
+from torch.nn import init
 
-from peft.tuners.tuners_utils import BaseTunerLayer
+from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
+from peft.utils import transpose
+from peft.utils.integrations import gather_params_ctx
 
+from .config import LoraConfig
 from .layer import LoraLayer
+
+
+def get_default_module_allowlist():
+    """Allowed module names that config.megatron_core can reference for import"""
+    return [
+        "megatron",
+    ]
 
 
 class LoraParallelLinear(nn.Module, LoraLayer):
@@ -37,25 +49,29 @@ class LoraParallelLinear(nn.Module, LoraLayer):
         self,
         base_layer,
         adapter_name: str,
+        config: LoraConfig,
         backend,
         r: int = 0,
         lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
-        fan_in_fan_out: bool = False,
-        init_lora_weights: bool = True,
-        use_rslora: bool = False,
-        use_dora: bool = False,
+        is_target_conv_1d_layer: bool = False,
         **kwargs,
     ):
-        super().__init__()
-        LoraLayer.__init__(self, base_layer=base_layer)
+        if config.lora_bias:
+            raise ValueError(f"{self.__class__.__name__} does not support lora_bias yet, set it to False")
 
-        if use_dora:
+        super().__init__()
+        LoraLayer.__init__(self, base_layer=base_layer, **kwargs)
+
+        if config.use_dora:
             raise ValueError(f"{self.__class__.__name__} does not support DoRA yet, please set it to False")
+        if config.velora_config is not None:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support VeLoRA yet, please set `velora_config=None`."
+            )
 
         self.backend = backend
         self.is_parallel_a = isinstance(base_layer, backend.RowParallelLinear)
-        self.fan_in_fan_out = fan_in_fan_out
+        self.fan_in_fan_out = config.fan_in_fan_out
         self._active_adapter = adapter_name
 
         megatron_config = kwargs["megatron_config"]
@@ -65,7 +81,7 @@ class LoraParallelLinear(nn.Module, LoraLayer):
             init_method = megatron_config.init_method
         input_is_parallel = True
         gather_output = False
-        if isinstance(base_layer, self.backend.RowParallelLinear):
+        if self.is_parallel_a:
             input_is_parallel = base_layer.input_is_parallel
         else:
             gather_output = base_layer.gather_output
@@ -73,32 +89,36 @@ class LoraParallelLinear(nn.Module, LoraLayer):
             adapter_name,
             r,
             lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            init_lora_weights=init_lora_weights,
-            use_rslora=use_rslora,
-            use_dora=use_dora,
+            config=config,
             init_method=init_method,
             input_is_parallel=input_is_parallel,
             gather_output=gather_output,
             **parallel_linear_kwargs,
         )
 
+        if is_target_conv_1d_layer:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support target_conv_1d_layer yet, please set it to False"
+            )
         self.is_target_conv_1d_layer = False
 
     def update_layer(
         self,
-        adapter_name,
-        r,
-        lora_alpha,
-        lora_dropout,
-        init_lora_weights,
-        use_rslora,
-        use_dora=False,
+        adapter_name: str,
+        r: int,
+        lora_alpha: int,
+        config: LoraConfig,
         init_method=init.xavier_normal_,
-        input_is_parallel=True,
-        gather_output=False,
+        input_is_parallel: bool = True,
+        gather_output: bool = False,
+        inference_mode: bool = False,
         **parallel_linear_kwargs,
-    ):
+    ) -> None:
+        lora_dropout = config.lora_dropout
+        init_lora_weights = config.init_lora_weights
+        use_rslora = config.use_rslora
+        use_dora = config.use_dora
+
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
         self.r[adapter_name] = r
@@ -137,23 +157,42 @@ class LoraParallelLinear(nn.Module, LoraLayer):
         self.lora_A[adapter_name] = lora_a
         self.lora_B[adapter_name] = lora_b
         if use_rslora:
-            self.scaling[adapter_name] = lora_alpha / (r**0.5)
+            self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
             self.scaling[adapter_name] = lora_alpha / r
-        if init_lora_weights:
+
+        self.use_dora[adapter_name] = use_dora
+
+        # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
+        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.pissa_init(adapter_name, init_lora_weights)
+        elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("corda"):
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.corda_init(adapter_name, init_lora_weights)
+        elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("astra"):
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.astra_init(adapter_name, init_lora_weights)
+        elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "olora":
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.olora_init(adapter_name)
+        elif init_lora_weights == "loftq":
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.loftq_init(adapter_name, config)
+        elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
 
-        weight = getattr(self.get_base_layer(), "weight", None)
-        if weight is not None:
-            # the layer is already completely initialized, this is an update
-            if weight.dtype.is_floating_point or weight.dtype.is_complex:
-                self.to(weight.device, dtype=weight.dtype)
-            else:
-                self.to(weight.device)
-        self.set_adapter(self.active_adapters)
+        # call this before dora_init
+        self._move_adapter_to_device_of_base_layer(adapter_name)
+
+        if adapter_name in self.lora_variant:
+            self.lora_variant[adapter_name].init(self, adapter_name=adapter_name, config=config)
+
+        self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
-        previous_dtype = x.dtype
+        self._check_forward_args(x, *args, **kwargs)
+        adapter_names = kwargs.pop("adapter_names", None)
         # If weight is used for matrix multiplication here, the final aggregation operation of the original
         # parallel_linear layer will be missing, so we need to directly call its forward function to obtain the
         # output of the original parallel_linear layer.
@@ -161,10 +200,13 @@ class LoraParallelLinear(nn.Module, LoraLayer):
             if self.merged:
                 self.unmerge()
             result, bias = self.base_layer(x, *args, **kwargs)
+        elif adapter_names is not None:
+            raise ValueError(f"{self.__class__.__name__} does not support mixed_batch_forward yet.")
         elif self.merged:
             result, bias = self.base_layer(x, *args, **kwargs)
         else:
             result, bias = self.base_layer(x, *args, **kwargs)
+            torch_result_dtype = result.dtype
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys():
                     continue
@@ -172,26 +214,109 @@ class LoraParallelLinear(nn.Module, LoraLayer):
                 lora_B = self.lora_B[active_adapter]
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
-                x = x.to(lora_A.weight.dtype)
+                x = self._cast_input_dtype(x, lora_A.weight.dtype)
+                result = result + lora_B(lora_A(dropout(x))) * scaling
 
-                lora_result = lora_A(dropout(x))
-                if isinstance(lora_result, tuple):
-                    lora_result = lora_result[0]
-                lora_result = lora_B(lora_result)
-                if isinstance(lora_result, tuple):
-                    lora_result = lora_result[0]
-                lora_result = lora_result * scaling
-
-                result = result + lora_result
-
-        result = result.to(previous_dtype)
+            result = result.to(torch_result_dtype)
         return result, bias
+
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+        """
+        Merge the active adapter weights into the base weights
+
+        Args:
+            safe_merge (`bool`, *optional*):
+                If True, the merge operation will be performed in a copy of the original weights and check for NaNs
+                before merging the weights. This is useful if you want to check if the merge operation will produce
+                NaNs. Defaults to `False`.
+            adapter_names (`list[str]`, *optional*):
+                The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
+                to `None`.
+        """
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            # no adapter to merge
+            return
+
+        for active_adapter in adapter_names:
+            if active_adapter in self.lora_A.keys():
+                base_layer = self.get_base_layer()
+                if safe_merge:
+                    # Note that safe_merge will be slower than the normal merge
+                    # because of the copy operation.
+                    orig_weights = base_layer.weight.data.clone()
+                    delta_weight = self.get_delta_weight(active_adapter)
+                    orig_weights = orig_weights + delta_weight
+
+                    if not torch.isfinite(orig_weights).all():
+                        raise ValueError(
+                            f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                        )
+
+                    base_layer.weight.data = orig_weights
+                else:
+                    delta_weight = self.get_delta_weight(active_adapter)
+                    base_layer.weight.data = base_layer.weight.data + delta_weight
+
+                self.merged_adapters.append(active_adapter)
+
+    def unmerge(self) -> None:
+        """
+        This method unmerges all merged adapter layers from the base weights.
+        """
+        if not self.merged:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+        while len(self.merged_adapters) > 0:
+            active_adapter = self.merged_adapters.pop()
+            if active_adapter in self.lora_A.keys():
+                weight = self.get_base_layer().weight
+                delta_weight = self.get_delta_weight(active_adapter)
+                weight.data -= delta_weight
+
+    def get_delta_weight(self, adapter) -> torch.Tensor:
+        """
+        Compute the delta weight for the given adapter.
+
+        Args:
+            adapter (str):
+                The name of the adapter for which the delta weight should be computed.
+        """
+        device = self.lora_B[adapter].weight.device
+        dtype = self.lora_B[adapter].weight.dtype
+
+        # In case users wants to merge the adapter weights that are in
+        # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
+        # (b)float16 because some CPUs have slow bf16/fp16 matmuls.
+        cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
+
+        weight_A = self.lora_A[adapter].weight
+        weight_B = self.lora_B[adapter].weight
+
+        if cast_to_fp32:
+            weight_A = weight_A.float()
+            weight_B = weight_B.float()
+
+        output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
+
+        if cast_to_fp32:
+            output_tensor = output_tensor.to(dtype=dtype)
+
+            # cast back the weights
+            self.lora_A[adapter].weight.data = weight_A.to(dtype)
+            self.lora_B[adapter].weight.data = weight_B.to(dtype)
+
+        return output_tensor
+
+    def __repr__(self) -> str:
+        rep = super().__repr__()
+        return "lora." + rep
 
 
 def dispatch_megatron(
     target: torch.nn.Module,
     adapter_name: str,
-    lora_config,
+    config: LoraConfig,
     **kwargs: Any,
 ) -> Optional[torch.nn.Module]:
     new_module = None
@@ -201,8 +326,14 @@ def dispatch_megatron(
     else:
         target_base_layer = target
 
-    if lora_config.megatron_config:
-        megatron_core = importlib.import_module(lora_config.megatron_core)
+    if config.megatron_config:
+        if not any(config.megatron_core.startswith(f"{prefix}.") for prefix in get_default_module_allowlist()):
+            raise ValueError(
+                f"{config.megatron_core=} does not start with a valid prefix ({get_default_module_allowlist()}) "
+                "which is unsupported due to being a potential security risk. If you think it should be supported, "
+                "please raise an issue in PEFT."
+            )
+        megatron_core = importlib.import_module(config.megatron_core)
     else:
         megatron_core = None
 
@@ -211,10 +342,10 @@ def dispatch_megatron(
         (megatron_core.tensor_parallel.ColumnParallelLinear, megatron_core.tensor_parallel.RowParallelLinear),
     ):
         megatron_kwargs = kwargs.copy()
-        megatron_config = lora_config.megatron_config
+        megatron_config = config.megatron_config
         if isinstance(megatron_config, dict):
             transformer_config_class = megatron_core.transformer.transformer_config.TransformerConfig
-            megatron_config = transformer_config_class(**lora_config.megatron_config)
+            megatron_config = transformer_config_class(**config.megatron_config)
         megatron_kwargs["megatron_config"] = megatron_config
         if megatron_kwargs["fan_in_fan_out"]:
             warnings.warn(
@@ -222,9 +353,13 @@ def dispatch_megatron(
                 "or `RowParallelLinear`. "
                 "Setting fan_in_fan_out to False."
             )
-            megatron_kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
+            megatron_kwargs["fan_in_fan_out"] = config.fan_in_fan_out = False
         new_module = LoraParallelLinear(
-            base_layer=target, adapter_name=adapter_name, backend=megatron_core.tensor_parallel, **megatron_kwargs
+            base_layer=target,
+            adapter_name=adapter_name,
+            config=config,
+            backend=megatron_core.tensor_parallel,
+            **megatron_kwargs,
         )
 
     return new_module

@@ -12,26 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-from typing import Dict, Type, Union
+
+import warnings
 
 import torch
-from torch import nn
 
-from peft.tuners.lycoris_utils import LycorisConfig, LycorisTuner
+from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer
+from peft.utils import (
+    TRANSFORMERS_MODELS_TO_OFT_TARGET_MODULES_MAPPING,
+    get_quantization_kwargs,
+    resolve_quantization_backend,
+)
 
-from .layer import Conv2d, Linear, OFTLayer
+from .layer import Conv2d, Embedding, Linear, OFTLayer
 
 
-class OFTModel(LycorisTuner):
+def _get_tuner_layer_class(target_base_layer: torch.nn.Module) -> type[OFTLayer] | None:
+    layer_cls: type[OFTLayer] | None = None
+    if isinstance(target_base_layer, torch.nn.Linear):
+        layer_cls = Linear
+    elif isinstance(target_base_layer, torch.nn.Conv2d):
+        layer_cls = Conv2d
+    elif isinstance(target_base_layer, torch.nn.Embedding):
+        layer_cls = Embedding
+    elif (quant_backend := resolve_quantization_backend(target_base_layer)) is not None:
+        layer_cls = {"linear": Linear, "conv2d": Conv2d}.get(quant_backend.layer_type)
+
+    return layer_cls
+
+
+class OFTModel(BaseTuner):
     """
     Creates Orthogonal Finetuning model from a pretrained model. The method is described in
-    https://arxiv.org/abs/2306.07280
+    https://huggingface.co/papers/2306.07280
 
     Args:
         model (`torch.nn.Module`): The model to which the adapter tuner layers will be attached.
         config ([`OFTConfig`]): The configuration of the OFT model.
         adapter_name (`str`): The name of the adapter, defaults to `"default"`.
+        low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
+            Create empty adapter weights on meta device. Useful to speed up the loading process.
 
     Returns:
         `torch.nn.Module`: The OFT model.
@@ -74,33 +94,86 @@ class OFTModel(LycorisTuner):
     """
 
     prefix: str = "oft_"
-    layers_mapping: Dict[Type[torch.nn.Module], Type[OFTLayer]] = {
-        torch.nn.Conv2d: Conv2d,
-        torch.nn.Linear: Linear,
-    }
+    tuner_layer_cls = OFTLayer
+    target_module_mapping = TRANSFORMERS_MODELS_TO_OFT_TARGET_MODULES_MAPPING
 
     def _create_and_replace(
         self,
-        config: LycorisConfig,
-        adapter_name: str,
-        target: Union[OFTLayer, nn.Module],
-        target_name: str,
-        parent: nn.Module,
-        current_key: str,
-    ) -> None:
-        """
-        A private method to create and replace the target module with the adapter module.
-        """
+        oft_config,
+        adapter_name,
+        target,
+        target_name,
+        parent,
+        current_key,
+        **optional_kwargs,
+    ):
+        if current_key is None:
+            raise ValueError("Current Key shouldn't be `None`")
 
-        # Regexp matching - Find key which matches current target_name in patterns provided
-        pattern_keys = list(config.rank_pattern.keys())
-        target_name_key = next(filter(lambda key: re.match(rf"(.*\.)?{key}$", current_key), pattern_keys), target_name)
+        kwargs = {
+            "r": oft_config.r,
+            "fan_in_fan_out": oft_config.fan_in_fan_out,
+        }
+        kwargs.update(get_quantization_kwargs(self))
 
-        kwargs = config.to_dict()
-        kwargs["r"] = config.rank_pattern.get(target_name_key, config.r)
-
-        if isinstance(target, OFTLayer):
-            target.update_layer(adapter_name, **kwargs)
-        else:
-            new_module = self._create_new_module(config, adapter_name, target, **kwargs)
+        # If it is not a OFTLayer, create a new module, else update it with new adapters
+        if not isinstance(target, OFTLayer):
+            new_module = self._create_new_module(oft_config, adapter_name, target, **kwargs)
+            if adapter_name not in self.active_adapters:
+                # adding an additional adapter: it is not automatically trainable
+                new_module.requires_grad_(False)
             self._replace_module(parent, target_name, new_module, target)
+        else:
+            target.update_layer(
+                adapter_name,
+                r=oft_config.r,
+                config=oft_config,
+            )
+
+    @staticmethod
+    def _create_new_module(oft_config, adapter_name, target, **kwargs):
+        if isinstance(target, BaseTunerLayer):
+            target_base_layer = target.get_base_layer()
+        else:
+            target_base_layer = target
+
+        layer_cls = _get_tuner_layer_class(target_base_layer)
+        if layer_cls is None:
+            raise TypeError(
+                f"Target module {target} is not supported. Currently, only `torch.nn.Linear`, `torch.nn.Conv2d`, "
+                "`torch.nn.Embedding` (optionally quantized) are supported."
+            )
+
+        if (layer_cls == Linear) and kwargs.get("fan_in_fan_out", False):
+            warnings.warn(
+                "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
+                "Setting fan_in_fan_out to False."
+            )
+            oft_config.fan_in_fan_out = False
+            kwargs["fan_in_fan_out"] = False
+
+        if layer_cls == Embedding:
+            kwargs.pop("fan_in_fan_out", None)
+
+        new_module = layer_cls(target, adapter_name, config=oft_config, **kwargs)
+        return new_module
+
+    def _check_merge_allowed(self):
+        """Verify that the configuration supports merging.
+
+        Currently gptq quantization and replicated layers do not support merging.
+        """
+        super()._check_merge_allowed()
+        if getattr(self.model, "quantization_method", None) == "gptq":
+            raise ValueError("Cannot merge OFT layers when the model is gptq quantized")
+        if self.peft_config.get("layer_replication"):
+            raise ValueError("Cannot merge OFT layers when base model layers are replicated")
+
+    @classmethod
+    def _remap_adapter_state_dict_for_load(cls, model, config, adapter_name, state_dict):
+        peft_model_state_dict = super()._remap_adapter_state_dict_for_load(model, config, adapter_name, state_dict)
+        if any(".oft_r." in key for key in peft_model_state_dict):
+            raise ValueError(
+                "Trying to load old OFT checkpoint, which is no longer supported. Please install PEFT <= v0.15.2 to load it or train a new OFT adapter."
+            )
+        return peft_model_state_dict

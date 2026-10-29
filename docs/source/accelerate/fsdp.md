@@ -74,7 +74,7 @@ accelerate launch --config_file "configs/fsdp_config.yaml"  train.py \
 --logging_steps 5 \
 --log_level "info" \
 --logging_strategy "steps" \
---evaluation_strategy "epoch" \
+--eval_strategy "epoch" \
 --save_strategy "epoch" \
 --push_to_hub \
 --hub_private_repo True \
@@ -84,7 +84,7 @@ accelerate launch --config_file "configs/fsdp_config.yaml"  train.py \
 --learning_rate 1e-4 \
 --lr_scheduler_type "cosine" \
 --weight_decay 1e-4 \
---warmup_ratio 0.0 \
+--warmup_steps 0 \
 --max_grad_norm 1.0 \
 --output_dir "llama-sft-lora-fsdp" \
 --per_device_train_batch_size 8 \
@@ -108,29 +108,22 @@ Notice that we are using LoRA with  rank=8, alpha=16 and targeting all linear la
 
 Let's dive a little deeper into the script so you can see what's going on, and understand how it works.
 
-The first thing to know is that the script uses FSDP for distributed training as the FSDP config has been passed. The `SFTTrainer` class handles all the heavy lifting of creating PEFT model using the peft config that is passed. After that when you call `trainer.train()`, Trainer internally uses 🤗 Accelerate to prepare model, optimizer and trainer using the FSDP config to create FSDP wrapped model which is then trained. The main code snippet is below:
+The first thing to know is that the script uses FSDP for distributed training as the FSDP config has been passed. The [`~trl.SFTTrainer`] class handles all the heavy lifting of creating PEFT model using the peft config that is passed. After that when you call `trainer.train()`, Trainer internally uses 🤗 Accelerate to prepare model, optimizer and trainer using the FSDP config to create FSDP wrapped model which is then trained. The main code snippet is below:
 
 ```python
 # trainer
 trainer = SFTTrainer(
     model=model,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
     peft_config=peft_config,
-    packing=data_args.packing,
-    dataset_kwargs={
-        "append_concat_token": data_args.append_concat_token,
-        "add_special_tokens": data_args.add_special_tokens,
-    },
-    dataset_text_field=data_args.dataset_text_field,
-    max_seq_length=data_args.max_seq_length,
 )
 trainer.accelerator.print(f"{trainer.model}")
 if model_args.use_peft_lora:
     # handle PEFT+FSDP case
-    trainer.model.print_trainable_parameters()
+    trainer.model.print_healthcheck()
     if getattr(trainer.accelerator.state, "fsdp_plugin", None):
         from peft.utils.other import fsdp_auto_wrap_policy
 
@@ -150,7 +143,7 @@ trainer.save_model()
 ```
 
 
-Here, one main thing to note currently when using FSDP with PEFT is that `use_orig_params` needs to be `False` to realize GPU memory savings. Due to `use_orig_params=False`, the auto wrap policy for FSDP needs to change so that trainable and non-trainable parameters are wrapped separately. This is done by the code snippt below which uses the util function `fsdp_auto_wrap_policy` from PEFT:
+Here, one main thing to note currently when using FSDP with PEFT is that `use_orig_params` needs to be `False` to realize GPU memory savings. Due to `use_orig_params=False`, the auto wrap policy for FSDP needs to change so that trainable and non-trainable parameters are wrapped separately. This is done by the code snippet below which uses the util function `fsdp_auto_wrap_policy` from PEFT:
 
 ```
 if getattr(trainer.accelerator.state, "fsdp_plugin", None):
@@ -173,7 +166,7 @@ In the above example, the memory consumed per GPU is  72-80 GB (90-98%) as seen 
 
 In this section, we will look at how to use QLoRA and FSDP for finetuning 70B llama model on 2X24GB GPUs. [Answer.AI](https://www.answer.ai/) in collaboration with bitsandbytes and Hugging Face 🤗 open sourced code enabling the usage of FSDP+QLoRA and explained the whole process in their insightful blogpost [You can now train a 70b language model at home](https://www.answer.ai/posts/2024-03-06-fsdp-qlora.html). This is now integrated in Hugging Face ecosystem. 
 
-For this, we first need `bitsandbytes>=0.43.0`, `accelerate>=0.28.0`, `transformers>4.38.2`, `trl>0.7.11` and `peft>0.9.0`. We need to set `fsdp_cpu_ram_efficient_loading=true`, `fsdp_use_orig_params=false` and `fsdp_offload_params=true`(cpu offloading) when using Accelerate config. When not using accelerate launcher, you can alternately set the environment variable `export FSDP_CPU_RAM_EFFICIENT_LOADING=true`.  Here, we will be using accelerate config and below is the config which can be found at [fsdp_config_qlora.yaml](https://github.com/huggingface/peft/blob/main/examples/sft/configs/fsdp_config_qlora.yaml):
+For this, we first need `bitsandbytes>=0.43.3`, `accelerate>=1.0.1`, `transformers>4.44.2`, `trl>0.11.4` and `peft>0.13.0`. We need to set `fsdp_cpu_ram_efficient_loading=true`, `fsdp_use_orig_params=false` and `fsdp_offload_params=true`(cpu offloading) when using Accelerate config. When not using accelerate launcher, you can alternately set the environment variable `export FSDP_CPU_RAM_EFFICIENT_LOADING=true`.  Here, we will be using accelerate config and below is the config which can be found at [fsdp_config_qlora.yaml](https://github.com/huggingface/peft/blob/main/examples/sft/configs/fsdp_config_qlora.yaml):
 
 ```yml
 compute_environment: LOCAL_MACHINE                                                                                                                                           
@@ -218,7 +211,7 @@ accelerate launch --config_file "configs/fsdp_config_qlora.yaml"  train.py \
 --logging_steps 5 \
 --log_level "info" \
 --logging_strategy "steps" \
---evaluation_strategy "epoch" \
+--eval_strategy "epoch" \
 --save_strategy "epoch" \
 --push_to_hub \
 --hub_private_repo True \
@@ -228,7 +221,7 @@ accelerate launch --config_file "configs/fsdp_config_qlora.yaml"  train.py \
 --learning_rate 1e-4 \
 --lr_scheduler_type "cosine" \
 --weight_decay 1e-4 \
---warmup_ratio 0.0 \
+--warmup_steps 0 \
 --max_grad_norm 1.0 \
 --output_dir "llama-sft-qlora-fsdp" \
 --per_device_train_batch_size 2 \
@@ -249,7 +242,7 @@ accelerate launch --config_file "configs/fsdp_config_qlora.yaml"  train.py \
 --bnb_4bit_quant_storage_dtype "bfloat16"
 ```
 
-Notice the new argument being passed, `bnb_4bit_quant_storage_dtype`, which denotes the data type for packing the 4-bit parameters. For example, when it is set to `bfloat16`, **32/4 = 8** 4-bit params are packed together post quantization. When using mixed precision training with `bfloat16`, `bnb_4bit_quant_storage_dtype` can be either `bfloat16` for pure `bfloat16` finetuning, or `float32` for automatic mixed precision (this consumes more GPU memory). When using mixed precision training with `float16`, `bnb_4bit_quant_storage_dtype` should be set to `float32` for stable automatic mixed precision training.
+Notice the new argument being passed, `bnb_4bit_quant_storage_dtype`, which denotes the data type for packing the 4-bit parameters. For example, when it is set to `bfloat16`, **16/4 = 4** 4-bit params are packed together post quantization. When using mixed precision training with `bfloat16`, `bnb_4bit_quant_storage_dtype` can be either `bfloat16` for pure `bfloat16` finetuning, or `float32` for automatic mixed precision (this consumes more GPU memory). When using mixed precision training with `float16`, `bnb_4bit_quant_storage_dtype` should be set to `float32` for stable automatic mixed precision training.
 
 In terms of training code, the important code changes are: 
 
@@ -271,11 +264,11 @@ model = AutoModelForCausalLM.from_pretrained(
     quantization_config=bnb_config,
     trust_remote_code=True,
     attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
-+   torch_dtype=quant_storage_dtype or torch.float32,
++   dtype=quant_storage_dtype or torch.float32,
 )
 ```
 
-Notice that `torch_dtype` for `AutoModelForCausalLM` is same as the `bnb_4bit_quant_storage` data type. That's it. Everything else is handled by Trainer and TRL.
+Notice that `dtype` for `AutoModelForCausalLM` is same as the `bnb_4bit_quant_storage` data type. That's it. Everything else is handled by Trainer and TRL.
 
 ## Memory usage
 
@@ -289,3 +282,5 @@ You can also refer the [llama-recipes](https://github.com/facebookresearch/llama
 2. Passing `modules_to_save` config parameter to is untested at present.
 3. GPU Memory saving when using CPU Offloading is untested at present.
 4. When using FSDP+QLoRA, `paged_adamw_8bit` currently results in an error when saving a checkpoint.
+5. DoRA training with FSDP should work (albeit at lower speed than LoRA). If combined with bitsandbytes (QDoRA), 4-bit quantization should also work, but 8-bit quantization has known issues and is not recommended.
+6. With FSDP2, `set_adapter()` and `set_requires_grad()` reshard the FSDP2 modules inside the [`PeftModel`], including the `PeftModel` itself, so that `requires_grad` changes reach the sharded parameters. Exiting `disable_adapter()` only does so if FSDP2 replaced the registered parameter objects inside it, as a forward does with sharded parameters, or if re-enabling changes `requires_grad` from what it was on entry. FSDP2 modules that shard parameters of a merged adapter layer are not resharded, so unmerge before calling these methods. With `reshard_after_forward=False`, or for the root module with the default `None`, the next forward all-gathers again. FSDP2 modules that wrap the `PeftModel` are not resharded; call `reshard()` on them before these methods. Because these calls can leave the base weights sharded, merging right after them doesn't work correctly (see 1). Prompt learning methods and adaption prompt are not covered yet.

@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,10 +16,15 @@ import importlib
 import os
 import unittest
 
+import pytest
 import torch
-import torch.nn.init as init
+from torch.nn import init
+from transformers import AutoModelForCausalLM
 
 from peft import LoraConfig, PeftModel, get_peft_model, get_peft_model_state_dict
+
+from .testing_common import hub_online_once
+from .testing_utils import require_torch_gpu
 
 
 def is_megatron_available() -> bool:
@@ -93,6 +95,7 @@ if is_megatron_available():
             x = self.lm_head(x)[0]
             return x
 
+    @require_torch_gpu
     class TestMegatronLora(unittest.TestCase):
         def setUp(self):
             initialize_model_parallel(1, 1)
@@ -166,3 +169,22 @@ if is_megatron_available():
 
             for key in peft_state_dict.keys():
                 assert "lora" in key
+
+    def test_megatron_core_unknown_package_raises(tmp_path):
+        # Mimic loading a megatron model with a adversarial `megatron_core` value to emulate
+        # a code execution attack. See #3085 and `AutoPeftModel.from_pretrained` (import_allowlist) for details.
+        model_id = "peft-internal-testing/tiny-random-LlamaForCausalLM"
+        with hub_online_once(model_id):
+            model = AutoModelForCausalLM.from_pretrained(model_id)
+
+        megatron_config = {"foo": 1}
+
+        lora_config = LoraConfig(
+            target_modules="all-linear",
+            megatron_config=megatron_config,
+            megatron_core="os.system",
+        )
+
+        with pytest.raises(ValueError) as e:
+            megatron_model = get_peft_model(model, lora_config)
+        assert "unsupported due to being a potential security" in str(e)

@@ -15,41 +15,57 @@ from __future__ import annotations
 
 import math
 import operator
+import os
 import re
 import warnings
 from contextlib import contextmanager
-from dataclasses import asdict, replace
-from enum import Enum
+from dataclasses import replace
 from functools import partial, reduce
-from itertools import chain
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
+import packaging.version
 import torch
+import transformers
 from torch import nn
-from tqdm import tqdm
 
-from peft.import_utils import is_bnb_4bit_available, is_bnb_available
+from peft.import_utils import (
+    is_bnb_4bit_available,
+    is_bnb_available,
+    is_transformers_dtensor_tp,
+    is_transformers_ge_v5_4_0,
+    is_transformers_ge_v5_17_0,
+)
 from peft.tuners.tuners_utils import (
     BaseTuner,
     BaseTunerLayer,
-    check_target_module_exists,
-    onload_layer,
+    find_parameter_name_by_module,
+    get_device_map,
     replicate_layers,
 )
 from peft.utils import (
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
+    AuxiliaryTrainingWrapper,
     ModulesToSaveWrapper,
     _freeze_adapter,
     _get_submodules,
+    get_peft_model_state_dict,
     get_quantization_config,
 )
+from peft.utils.integrations import TpInfo
 from peft.utils.merge_utils import dare_linear, dare_ties, magnitude_prune, task_arithmetic, ties
+from peft.utils.other import get_pattern_key
+from peft.utils.save_and_load import _maybe_shard_state_dict_for_tp
 
 from .aqlm import dispatch_aqlm
 from .awq import dispatch_awq
 from .config import LoraConfig
+from .eetq import dispatch_eetq
 from .gptq import dispatch_gptq
-from .layer import Conv2d, LoraLayer, dispatch_default
+from .hqq import dispatch_hqq
+from .inc import dispatch_inc
+from .layer import Embedding, LoraLayer, MultiheadAttention, ParamWrapper, _ConvNd, dispatch_default
+from .te import dispatch_transformer_engine
+from .torchao import dispatch_torchao
 from .tp_layer import dispatch_megatron
 
 
@@ -59,16 +75,83 @@ def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
     return args, kwargs
 
 
+def _alora_offsets_pre_forward_hook(target, args, kwargs, alora_offsets):
+    kwargs["alora_offsets"] = alora_offsets
+    return args, kwargs
+
+
+def _get_encoder(model: nn.Module) -> nn.Module | None:
+    """Check if the model has an encoder and if it has, returns it; otherwise returns None"""
+    if not hasattr(model, "get_encoder"):
+        return None
+
+    encoder = model.get_encoder()
+    # https://github.com/huggingface/transformers/pull/42156
+    # new logic in transformers v5: all PretrainedModels return a model here, but it is self if there is no encoder
+    if encoder is model:
+        return None
+    return encoder
+
+
+def _replace_layer_number_by_wildcard(name: str) -> str:
+    return re.sub(r"\.\d+(\.|$)", lambda m: ".*" + m.group(1), name)
+
+
+def get_tp_plan_and_mesh(model, current_key: str):
+    device_mesh = getattr(model, "_device_mesh", None)
+    if device_mesh is None:
+        return None, None
+
+    distributed_config = getattr(model.config, "distributed_config", None)
+    if getattr(distributed_config, "tp_size", 1) <= 1:
+        return None, None
+
+    # A named mesh must actually contain TP, an FSDP-only mesh is not a TP mesh.
+    mesh_dim_names = device_mesh.mesh_dim_names
+    if mesh_dim_names is not None and "tp" not in mesh_dim_names:
+        return None, None
+
+    if not is_transformers_ge_v5_17_0:
+        raise RuntimeError("LoRA with DTensor tensor parallelism requires transformers >= 5.17.0. Please upgrade.")
+
+    tp_plan = getattr(model, "tp_plan", None)
+    if tp_plan is None:
+        return None, None
+
+    plan_name = tp_plan.get(_replace_layer_number_by_wildcard(current_key))
+    if plan_name is None:
+        return None, None
+
+    # Match Transformers: use a TP-only mesh directly, and select TP from a combined FSDP/PP mesh.
+    tp_mesh = device_mesh["tp"] if device_mesh.ndim > 1 else device_mesh
+    return plan_name, tp_mesh
+
+
+def add_lora_tp_hooks_dtensor(tp_module: nn.Module, tp_plan_name: str, device_mesh, *, module_name: str) -> None:
+    from transformers.distributed.tensor_parallel import ALL_PARALLEL_STYLES
+
+    style = ALL_PARALLEL_STYLES[tp_plan_name]
+    if tp_plan_name not in ("colwise", "rowwise"):
+        raise ValueError(f"Unsupported TP plan {tp_plan_name} for LoRA: only colwise and rowwise are supported.")
+
+    for p_name, _ in list(tp_module.named_parameters(recurse=False)):
+        style.validate_param(tp_module, p_name, device_mesh, parameter_name=f"{module_name}.{p_name}")
+        style.shard_param(tp_module, p_name, device_mesh)
+    style.install_forward(tp_module, device_mesh)
+
+
 class LoraModel(BaseTuner):
     """
     Creates Low Rank Adapter (LoRA) model from a pretrained transformers model.
 
-    The method is described in detail in https://arxiv.org/abs/2106.09685.
+    The method is described in detail in https://huggingface.co/papers/2106.09685.
 
     Args:
         model ([`torch.nn.Module`]): The model to be adapted.
         config ([`LoraConfig`]): The configuration of the Lora model.
         adapter_name (`str`): The name of the adapter, defaults to `"default"`.
+        low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
+            Create empty adapter weights on meta device. Useful to speed up the loading process.
 
     Returns:
         `torch.nn.Module`: The Lora model.
@@ -77,7 +160,7 @@ class LoraModel(BaseTuner):
 
         ```py
         >>> from transformers import AutoModelForSeq2SeqLM
-        >>> from peft import LoraModel, LoraConfig
+        >>> from peft import LoraConfig, get_peft_model
 
         >>> config = LoraConfig(
         ...     task_type="SEQ_2_SEQ_LM",
@@ -88,13 +171,13 @@ class LoraModel(BaseTuner):
         ... )
 
         >>> model = AutoModelForSeq2SeqLM.from_pretrained("t5-base")
-        >>> lora_model = LoraModel(model, config, "default")
+        >>> lora_model = get_peft_model(model, config)
         ```
 
         ```py
         >>> import torch
         >>> import transformers
-        >>> from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+        >>> from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
         >>> rank = ...
         >>> target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc_in", "fc_out", "wte"]
@@ -131,28 +214,8 @@ class LoraModel(BaseTuner):
     """
 
     prefix: str = "lora_"
-
-    def __init__(self, model, config, adapter_name) -> None:
-        super().__init__(model, config, adapter_name)
-
-    def _check_new_adapter_config(self, config: LoraConfig) -> None:
-        """
-        A helper method to check the config when a new adapter is being added.
-
-        Raise a ValueError if there is something wrong with the config or if it conflicts with existing adapters.
-
-        """
-        # TODO: there should be a check if any of the existing adapters actually has bias != "none", or else the check
-        # does not fully correspond to the error message.
-        if (len(self.peft_config) > 1) and (config.bias != "none"):
-            raise ValueError(
-                f"{self.__class__.__name__} supports only 1 adapter with bias. When using multiple adapters, "
-                "set bias to 'none' for all adapters."
-            )
-
-    @staticmethod
-    def _check_target_module_exists(lora_config, key):
-        return check_target_module_exists(lora_config, key)
+    tuner_layer_cls = LoraLayer
+    target_module_mapping = TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING
 
     def _prepare_model(self, peft_config: LoraConfig, model: nn.Module):
         r"""
@@ -167,6 +230,45 @@ class LoraModel(BaseTuner):
         if peft_config.layer_replication:
             replicate_layers(model, peft_config.layer_replication)
 
+    def _check_new_adapter_config(self, config: LoraConfig) -> None:
+        super()._check_new_adapter_config(config)
+
+        # KaSA destructively truncates the base weight when the adapter is initialized, so the base weight that any
+        # other adapter sees depends on whether a KaSA adapter was added before it. To avoid silently inconsistent
+        # results, mixing KaSA and non-KaSA adapters on the same model is not supported.
+        new_uses_kasa = getattr(config, "kasa_config", None) is not None
+        for adapter_name, other_conf in self.peft_config.items():
+            if other_conf is config:
+                continue
+            other_uses_kasa = getattr(other_conf, "kasa_config", None) is not None
+            if new_uses_kasa is not other_uses_kasa:
+                raise ValueError(
+                    "KaSA cannot be combined with adapters that don't use KaSA, since KaSA modifies the base "
+                    f"weights: the new adapter {'uses' if new_uses_kasa else 'does not use'} KaSA but adapter "
+                    f"'{adapter_name}' {'does not' if new_uses_kasa else 'does'}."
+                )
+
+        # Multiple adapters that use `target_parameters` are supported, but they must all target the same set of
+        # parameters. The reason is that the targeted parameters are wrapped with (possibly nested) lora.ParamWrapper
+        # layers, and which parameter a LoRA weight belongs to is encoded by its position in that nesting. If different
+        # adapters targeted different parameters, the nesting (and thus the state_dict keys) would differ between
+        # adapters, which is not supported.
+        target_parameters = getattr(config, "target_parameters", None)
+        if not target_parameters:
+            return
+
+        target_parameters = set(target_parameters)  # set is okay as we don't support str for this arg
+        for adapter_name, other_conf in self.peft_config.items():
+            if other_conf is config:
+                continue
+            other_target_parameters = getattr(other_conf, "target_parameters", None)
+            if other_target_parameters and (set(other_target_parameters) != target_parameters):
+                raise ValueError(
+                    "When using multiple adapters with `target_parameters`, all adapters must target the same set of "
+                    f"parameters, but got {sorted(target_parameters)} for the new adapter and "
+                    f"{sorted(other_target_parameters)} for adapter '{adapter_name}'."
+                )
+
     def _create_and_replace(
         self,
         lora_config,
@@ -175,27 +277,47 @@ class LoraModel(BaseTuner):
         target_name,
         parent,
         current_key,
-    ):
+        *,
+        parameter_name: Optional[str] = None,
+    ) -> None:
         if current_key is None:
             raise ValueError("Current Key shouldn't be `None`")
 
         # Regexp matching - Find key which matches current target_name in patterns provided
-        pattern_keys = list(chain(lora_config.rank_pattern.keys(), lora_config.alpha_pattern.keys()))
-        target_name_key = next(filter(lambda key: re.match(rf".*\.{key}$", current_key), pattern_keys), current_key)
-        r = lora_config.rank_pattern.get(target_name_key, lora_config.r)
-        alpha = lora_config.alpha_pattern.get(target_name_key, lora_config.lora_alpha)
+        r_key = get_pattern_key(lora_config.rank_pattern.keys(), current_key)
+        alpha_key = get_pattern_key(lora_config.alpha_pattern.keys(), current_key)
+        r = lora_config.rank_pattern.get(r_key, lora_config.r)
+        alpha = lora_config.alpha_pattern.get(alpha_key, lora_config.lora_alpha)
+
+        # Checks if the target is marked as a tied layer
+        # If true, we add the reference to lora adapters of embedding layer in `tied_adapter`
+        is_tied = target_name in (getattr(lora_config, "target_modules_to_tie", []) or [])
+        tied_adapter = {}
+        if is_tied:
+            tied_module = self.model.get_input_embeddings()
+            emb_A = tied_module.lora_embedding_A[adapter_name]
+            emb_B = tied_module.lora_embedding_B[adapter_name]
+
+            tied_adapter = {"lora_A": emb_B.t(), "lora_B": emb_A.t()}
 
         kwargs = {
             "r": r,
             "lora_alpha": alpha,
-            "lora_dropout": lora_config.lora_dropout,
-            "fan_in_fan_out": lora_config.fan_in_fan_out,
-            "init_lora_weights": lora_config.init_lora_weights,
-            "use_rslora": lora_config.use_rslora,
-            "use_dora": lora_config.use_dora,
+            "target_name": current_key,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
+            "ephemeral_gpu_offload": lora_config.runtime_config.ephemeral_gpu_offload,
+            "parameter_name": parameter_name,
+            "tied_adapter": tied_adapter,
         }
+
+        # for torchao merging, we need the get_apply_tensor_subclass from the quantization config
+        try:
+            kwargs["get_apply_tensor_subclass"] = operator.attrgetter(
+                "hf_quantizer.quantization_config.get_apply_tensor_subclass"
+            )(self.model)
+        except AttributeError:
+            pass
 
         quant_methods = ["gptq", "aqlm", "awq"]
         for quant_method in quant_methods:
@@ -206,24 +328,125 @@ class LoraModel(BaseTuner):
         # note: AdaLoraLayer is a subclass of LoraLayer, we need to exclude it
         from peft.tuners.adalora import AdaLoraLayer
 
-        if isinstance(target, LoraLayer) and not isinstance(target, AdaLoraLayer):
+        # if the target is a ParamWrapper, we nest it to allow targeting multiple nn.Parameter on the same module
+        wrap_target_param = isinstance(target, ParamWrapper) and (adapter_name in target.lora_A)
+        is_existing_lora_layer = (
+            isinstance(target, LoraLayer) and not isinstance(target, AdaLoraLayer) and not wrap_target_param
+        )
+
+        if is_transformers_dtensor_tp:
+            # Transformers' newer DTensor-based TP API stores the plan/mesh on the top-level
+            # model (`model.tp_plan`/`model._device_mesh`) instead of per-module attributes. Stamp
+            # the old per-module attribute names onto the base layer before `update_layer`/
+            # `_create_new_module` run below. This way it preserves the existing logic.
+            base_layer = target.get_base_layer() if is_existing_lora_layer else target
+            if getattr(base_layer, "_hf_tp_plan", None) is None:
+                tp_plan, device_mesh = get_tp_plan_and_mesh(self.model, current_key)
+                if tp_plan is not None:
+                    base_layer._hf_tp_plan = tp_plan
+                    base_layer._hf_device_mesh = device_mesh
+
+        if is_existing_lora_layer:
             target.update_layer(
                 adapter_name,
                 r,
                 lora_alpha=alpha,
-                lora_dropout=lora_config.lora_dropout,
-                init_lora_weights=lora_config.init_lora_weights,
-                use_rslora=lora_config.use_rslora,
-                use_dora=lora_config.use_dora,
+                target_name=current_key,
+                config=lora_config,
             )
+
+            base_layer = target.get_base_layer()
+            lora_module = target
         else:
-            new_module = self._create_new_module(lora_config, adapter_name, target, **kwargs)
-            if adapter_name != self.active_adapter:
+            if isinstance(target, ParamWrapper) and (parameter_name == target.parameter_name):
+                raise ValueError(
+                    "Trying to target the same nn.Parameter twice, this should not happen. Please open an issue on the "
+                    "PEFT repo: https://github.com/huggingface/peft/issues"
+                )
+            device_map = get_device_map(self.model)
+            new_module = self._create_new_module(lora_config, adapter_name, target, device_map=device_map, **kwargs)
+            if adapter_name not in self.active_adapters:
                 # adding an additional adapter: it is not automatically trainable
                 new_module.requires_grad_(False)
             self._replace_module(parent, target_name, new_module, target)
 
+            base_layer = target
+            lora_module = new_module
+
+        tp_plan = getattr(base_layer, "_hf_tp_plan", None)
+        device_mesh = getattr(base_layer, "_hf_device_mesh", None)
+
+        # If the module has a tp_plan, we add hooks to the LoRA layers to make sure they respect the plan
+        if tp_plan is not None:
+            if not is_transformers_ge_v5_4_0:
+                raise RuntimeError(
+                    "The base model is tensor-parallel sharded but the installed version of Transformers does not "
+                    "support LoRA with Tensor Parallelism. Please upgrade to transformers >= 5.4.0."
+                )
+
+            if not is_transformers_dtensor_tp:
+                from transformers.integrations.tensor_parallel import (
+                    add_tensor_parallel_hooks_to_module,
+                )
+
+            _SUPPORTED_TP_PLANS = ("colwise", "rowwise", "embedding_rowwise")
+
+            if tp_plan not in _SUPPORTED_TP_PLANS:
+                warnings.warn(
+                    f'TP plan "{tp_plan}" on the base layer is not supported for LoRA. '
+                    "LoRA adapters will be created without tensor parallel hooks."
+                )
+            else:
+                tp_plan_keys = []
+                tp_plans = []
+                generic_key = re.sub(r"\d+", "*", current_key)
+                if tp_plan in ["colwise", "rowwise"]:
+                    if tp_plan == "colwise":
+                        tp_plan_keys.append(f"{generic_key}.lora_B.{adapter_name}.weight")
+                        tp_module = lora_module.lora_B[adapter_name]
+                        tp_layer_name = (f"{current_key}.lora_B.{adapter_name}",)
+                    else:  # rowwise
+                        tp_plan_keys.append(f"{generic_key}.lora_A.{adapter_name}.weight")
+                        tp_module = lora_module.lora_A[adapter_name]
+                        tp_layer_name = (f"{current_key}.lora_A.{adapter_name}",)
+                    tp_plans.append(tp_plan)
+                    if is_transformers_dtensor_tp:
+                        add_lora_tp_hooks_dtensor(
+                            tp_module,
+                            tp_plan,
+                            device_mesh,
+                            module_name=tp_layer_name[0],
+                        )
+                    else:
+                        add_tensor_parallel_hooks_to_module(
+                            self.model,
+                            tp_module,
+                            tp_plan,
+                            tp_layer_name,
+                            device_mesh,
+                        )
+                else:  # embedding_rowwise
+                    # TP hooks are  handled in the `_embed` method in lora/layer.py where they are explicitly called.
+                    # Here we simply register the TP plans.
+                    tp_plan_keys.append(f"{generic_key}.base_layer.weight")
+                    tp_plan_keys.append(f"{generic_key}.lora_embedding_A.{adapter_name}")
+                    tp_plans.append(tp_plan)
+                    # Because lora_embedding_A is transposed compared to nn.Embedding, we set the TP plan
+                    # to embedding_colwise so that the gathering happens on the correct dimension at save time.
+                    tp_plans.append("embedding_colwise")
+
+                if not is_transformers_dtensor_tp:
+                    # DTensor parameters carry their own sharding metadata, so this per-module marker
+                    # is only needed for the pre-DTensor TP integration.
+                    lora_module._tp_info = TpInfo(
+                        tp_plan=dict(zip(tp_plan_keys, tp_plans)),
+                        device_mesh=device_mesh,
+                        tp_size=self.model._tp_size,
+                    )
+
     def _replace_module(self, parent, child_name, new_module, child):
+        # override in LoraModel to handle quantized weights properly
+
         setattr(parent, child_name, new_module)
         # It's not necessary to set requires_grad here, as that is handled by
         # _mark_only_adapters_as_trainable
@@ -232,50 +455,48 @@ class LoraModel(BaseTuner):
         if hasattr(child, "base_layer"):
             child = child.base_layer
 
-        if not hasattr(new_module, "base_layer"):
-            new_module.weight = child.weight
-            if hasattr(child, "bias"):
-                new_module.bias = child.bias
-
-        if getattr(child, "state", None) is not None:
-            if hasattr(new_module, "base_layer"):
-                new_module.base_layer.state = child.state
-            else:
-                new_module.state = child.state
-            new_module.to(child.weight.device)
-
+        meta = torch.device("meta")
         # dispatch to correct device
         for name, module in new_module.named_modules():
             if (self.prefix in name) or ("ranknum" in name):
-                weight = child.qweight if hasattr(child, "qweight") else child.weight
-                module.to(weight.device)
-
-    def _mark_only_adapters_as_trainable(self, model: nn.Module) -> None:
-        for n, p in model.named_parameters():
-            if self.prefix not in n:
-                p.requires_grad = False
-
-        for active_adapter in self.active_adapters:
-            bias = self.peft_config[active_adapter].bias
-            if bias == "none":
-                continue
-
-            if bias == "all":
-                for n, p in model.named_parameters():
-                    if "bias" in n:
-                        p.requires_grad = True
-            elif bias == "lora_only":
-                for m in model.modules():
-                    if isinstance(m, LoraLayer) and hasattr(m, "bias") and m.bias is not None:
-                        m.bias.requires_grad = True
-            else:
-                raise NotImplementedError(f"Requested bias: {bias}, is not implemented.")
+                if hasattr(child, "qweight"):
+                    weight = child.qweight
+                elif hasattr(child, "W_q"):
+                    weight = child.W_q
+                elif hasattr(child, "weight"):
+                    weight = child.weight
+                elif getattr(child, "in_proj_weight", None) is not None:  # MHA
+                    weight = child.in_proj_weight
+                else:
+                    weight = next(child.parameters())
+                if not any(p.device == meta for p in module.parameters()):
+                    module.to(weight.device)
 
     @staticmethod
     def _create_new_module(lora_config, adapter_name, target, **kwargs):
         # Collect dispatcher functions to decide what backend to use for the replaced LoRA layer. The order matters,
         # because the first match is always used. Therefore, the default layers should be checked last.
         dispatchers = []
+
+        if lora_config._custom_modules:
+            # Experimental custom LoRA module support. Allows users to pass a custom mapping for unsupported layer
+            # types by implementing their own LoRA layers.
+            def dynamic_dispatch_func(target, adapter_name, config, **kwargs):
+                new_module = None
+
+                if isinstance(target, BaseTunerLayer):
+                    target_base_layer = target.get_base_layer()
+                else:
+                    target_base_layer = target
+
+                for key, custom_cls in config._custom_modules.items():
+                    if isinstance(target_base_layer, key):
+                        new_module = custom_cls(target, adapter_name, config=config, **kwargs)
+                        break
+
+                return new_module
+
+            dispatchers.append(dynamic_dispatch_func)
 
         # avoid eager bnb import
         if is_bnb_available():
@@ -288,11 +509,24 @@ class LoraModel(BaseTuner):
 
             dispatchers.append(dispatch_bnb_4bit)
 
-        dispatchers.extend([dispatch_aqlm, dispatch_awq, dispatch_gptq, dispatch_megatron, dispatch_default])
+        dispatchers.extend(
+            [
+                dispatch_eetq,
+                dispatch_aqlm,
+                dispatch_awq,
+                dispatch_gptq,
+                dispatch_hqq,
+                dispatch_inc,
+                dispatch_torchao,
+                dispatch_megatron,
+                dispatch_transformer_engine,
+                dispatch_default,
+            ]
+        )
 
         new_module = None
         for dispatcher in dispatchers:
-            new_module = dispatcher(target, adapter_name, lora_config=lora_config, **kwargs)
+            new_module = dispatcher(target, adapter_name, config=lora_config, **kwargs)
             if new_module is not None:  # first match wins
                 break
 
@@ -300,95 +534,124 @@ class LoraModel(BaseTuner):
             # no module could be matched
             raise ValueError(
                 f"Target module {target} is not supported. Currently, only the following modules are supported: "
-                "`torch.nn.Linear`, `torch.nn.Embedding`, `torch.nn.Conv2d`, `transformers.pytorch_utils.Conv1D`."
+                "`torch.nn.Linear`, `torch.nn.Embedding`, `torch.nn.Conv1d`, `torch.nn.Conv2d`, `torch.nn.Conv3d`, "
+                "`transformers.pytorch_utils.Conv1D`, `torch.nn.MultiheadAttention.`."
             )
 
         return new_module
-
-    def __getattr__(self, name: str):
-        """Forward missing attributes to the wrapped module."""
-        try:
-            return super().__getattr__(name)  # defer to nn.Module's logic
-        except AttributeError:
-            return getattr(self.model, name)
-
-    def get_peft_config_as_dict(self, inference: bool = False):
-        config_dict = {}
-        for key, value in self.peft_config.items():
-            config = {k: v.value if isinstance(v, Enum) else v for k, v in asdict(value).items()}
-            if inference:
-                config["inference_mode"] = True
-        config_dict[key] = config
-        return config
-
-    def _set_adapter_layers(self, enabled: bool = True) -> None:
-        for module in self.model.modules():
-            if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
-                module.enable_adapters(enabled)
-
-    def enable_adapter_layers(self) -> None:
-        """Enable all adapters.
-
-        Call this if you have previously disabled all adapters and want to re-enable them.
-        """
-        self._set_adapter_layers(enabled=True)
-
-    def disable_adapter_layers(self) -> None:
-        """Disable all adapters.
-
-        When disabling all adapters, the model output corresponds to the output of the base model.
-        """
-        for active_adapter in self.active_adapters:
-            val = self.peft_config[active_adapter].bias
-            if val != "none":
-                msg = (
-                    f"Careful, disabling adapter layers with bias configured to be '{val}' does not produce the same "
-                    "output as the the base model would without adaption."
-                )
-                warnings.warn(msg)
-        self._set_adapter_layers(enabled=False)
-
-    def set_adapter(self, adapter_name: str | list[str]) -> None:
-        """Set the active adapter(s).
-
-        Additionally, this function will set the specified adapters to trainable (i.e., requires_grad=True). If this is
-        not desired, use the following code.
-
-        ```py
-        >>> for name, param in model_peft.named_parameters():
-        ...     if ...:  # some check on name (ex. if 'lora' in name)
-        ...         param.requires_grad = False
-        ```
-
-        Args:
-            adapter_name (`str` or `list[str]`): Name of the adapter(s) to be activated.
-        """
-        for module in self.model.modules():
-            if isinstance(module, LoraLayer):
-                if module.merged:
-                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
-                    module.unmerge()
-                module.set_adapter(adapter_name)
-        self.active_adapter = adapter_name
 
     @contextmanager
     def _enable_peft_forward_hooks(self, *args, **kwargs):
         # If adapter_names is passed as an argument, we inject it into the forward arguments.
         adapter_names = kwargs.pop("adapter_names", None)
-        if adapter_names is None:
+        alora_offsets = kwargs.pop("alora_offsets", None)
+
+        if adapter_names is None and alora_offsets is None:
             # nothing to do
             yield
             return
-
-        if self.training:
-            raise ValueError("Cannot pass `adapter_names` when the model is in training mode.")
-
         hook_handles = []
-        for module in self.modules():
-            if isinstance(module, LoraLayer):
-                pre_forward = partial(_adapter_names_pre_forward_hook, adapter_names=adapter_names)
-                handle = module.register_forward_pre_hook(pre_forward, with_kwargs=True)
-                hook_handles.append(handle)
+
+        if alora_offsets is not None:
+            # TODO: remove once transformers 4.52 is no longer supported. Note that 4.52.0 is yanked, so 4.52.1
+            # is the first 4.52 release.
+            transformers_lt_4_52 = packaging.version.parse(transformers.__version__) < packaging.version.parse(
+                "4.52.1"
+            )
+            if transformers_lt_4_52:
+                raise ValueError("Using aLoRA requires transformers >= 4.52.1.")
+
+            from transformers.modeling_layers import GradientCheckpointingLayer
+
+            for n, layer in self.named_modules():
+                # gradient checkpointing layer are executed concurrently to the 'normal' forward call
+                # (in the backward step the gradient checkpointing layer's forward will be executed again).
+                # this means that when the gradient checkpointing layer is called, the _enable_peft_forward_hooks
+                # context manager is long gone. to be consistent with the normal forward we need to register the pre
+                # hooks for this concurrent forward call as well.
+                #
+                # Note that this will lead to double application of whatever the callbacks do in normal forward.
+                # Make sure that whatever change is done, can be applied more than once without harm (idempotency).
+                if isinstance(layer, GradientCheckpointingLayer) and layer.gradient_checkpointing:
+
+                    def forward_pre_hook(name, module, inputs, **kwargs):
+                        for submodule in module.modules():
+                            if isinstance(submodule, LoraLayer):
+                                handle = submodule.register_forward_pre_hook(
+                                    partial(_alora_offsets_pre_forward_hook, alora_offsets=kwargs["alora_offsets"]),
+                                    with_kwargs=True,
+                                )
+                                module._peft_gradient_checkpointing_forward_hooks.append(handle)
+
+                    def backward_hook(name, module, *grad_output, **kwargs):
+                        while module._peft_gradient_checkpointing_forward_hooks:
+                            module._peft_gradient_checkpointing_forward_hooks.pop().remove()
+
+                    if getattr(layer, "_peft_gradient_checkpointing_forward_hooks", []):
+                        raise ValueError(
+                            "Multiple invocations of PEFT forward hooks before .backward() with enabled gradient "
+                            "checkpointing. Disable gradient checkpointing or only call forward once per backward."
+                        )
+                    layer._peft_gradient_checkpointing_forward_hooks = []
+                    handle = layer.register_forward_pre_hook(partial(forward_pre_hook, n, alora_offsets=alora_offsets))
+                    layer._peft_gradient_checkpointing_forward_hooks.append(handle)
+                    handle = layer.register_full_backward_hook(partial(backward_hook, n))
+                    layer._peft_gradient_checkpointing_forward_hooks.append(handle)
+                if isinstance(layer, LoraLayer):
+                    pre_forward = partial(_alora_offsets_pre_forward_hook, alora_offsets=alora_offsets)
+                    handle = layer.register_forward_pre_hook(pre_forward, with_kwargs=True)
+                    hook_handles.append(handle)
+        num_beams = kwargs.get("num_beams", None)
+        uses_beam_search = isinstance(num_beams, int) and (num_beams > 1)
+        if uses_beam_search:
+            if alora_offsets is not None:
+                raise ValueError("Beam search not yet supported for aLoRA.")
+        if adapter_names is not None:
+            if self.training:
+                raise ValueError("Cannot pass `adapter_names` when the model is in training mode.")
+
+            # Check that users only passed actually existing adapters.
+            # Note: We cannot do this on the layer level, as each individual layer may not have each adapter. Still, we want
+            # to check that there is at least one layer with the given name, or else something like typos can easily slip.
+            expected_adapters = set()
+            for layer in self.modules():
+                if isinstance(layer, LoraLayer):
+                    expected_adapters |= layer.lora_A.keys()
+                    expected_adapters |= layer.lora_embedding_A.keys()
+            unique_adapters = {name for name in adapter_names if name != "__base__"}
+            unexpected_adapters = unique_adapters - expected_adapters
+            if unexpected_adapters:
+                raise ValueError(
+                    f"Trying to infer with non-existing adapter(s): {', '.join(sorted(unexpected_adapters))}"
+                )
+
+            # deal with beam search
+            original_adapter_names = adapter_names[:]
+            if uses_beam_search:
+                if not isinstance(adapter_names, (list, tuple)):
+                    raise TypeError(f"Got adapter names of type {type(adapter_names)}, expected a list of str.")
+                # When there is beam search, the inputs are repeated n times, thus we repeat each adapter name n times and
+                # then flatten the nested list. For encoder-decoder models, this extended list should not be applied to the
+                # encoder part. Further below, the original argument is thus restored for the encoder.
+                adapter_names = [n for n in adapter_names for _ in range(kwargs["num_beams"])]
+
+            for module in self.modules():
+                if isinstance(module, (LoraLayer, AuxiliaryTrainingWrapper)):
+                    pre_forward = partial(_adapter_names_pre_forward_hook, adapter_names=adapter_names)
+                    handle = module.register_forward_pre_hook(pre_forward, with_kwargs=True)
+                    hook_handles.append(handle)
+
+            encoder = _get_encoder(self.model)
+            if uses_beam_search and (encoder is not None):
+                # For encoder-decoder models, even when applying beam search, the encoder part of the model should not use
+                # the extended adapter_names. This is because the encoder still uses the original, non-extended samples.
+                for module in encoder.modules():
+                    if isinstance(module, (LoraLayer, AuxiliaryTrainingWrapper)):
+                        # Add another hook to overwrite the kwargs with the original adapter names -- this is easier than
+                        # trying to exclude the encoder.
+                        pre_forward = partial(_adapter_names_pre_forward_hook, adapter_names=original_adapter_names)
+                        handle = module.register_forward_pre_hook(pre_forward, with_kwargs=True)
+                        hook_handles.append(handle)
 
         yield
 
@@ -400,66 +663,146 @@ class LoraModel(BaseTuner):
 
         Currently gptq quantization and replicated layers do not support merging.
         """
+        super()._check_merge_allowed()
         if getattr(self.model, "quantization_method", None) == "gptq":
             raise ValueError("Cannot merge LORA layers when the model is gptq quantized")
         if self.peft_config.get("layer_replication"):
             raise ValueError("Cannot merge LORA layers when base model layers are replicated")
 
-    @staticmethod
-    def _prepare_adapter_config(peft_config, model_config):
+    def _prepare_adapter_config(self, peft_config, model_config):
         if peft_config.target_modules is None:
-            if model_config["model_type"] not in TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING:
-                raise ValueError("Please specify `target_modules` in `peft_config`")
-            peft_config.target_modules = set(
-                TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[model_config["model_type"]]
-            )
+            target_modules = self.target_module_mapping.get(model_config["model_type"])
+            if target_modules is not None:
+                if isinstance(target_modules, str):
+                    peft_config.target_modules = target_modules
+                else:
+                    peft_config.target_modules = set(target_modules)
+            elif not peft_config.target_parameters:
+                raise ValueError("Please specify `target_modules` or `target_parameters`in `peft_config`")
         return peft_config
 
-    def _unload_and_optionally_merge(
-        self,
-        merge=True,
-        progressbar: bool = False,
-        safe_merge: bool = False,
-        adapter_names: Optional[list[str]] = None,
-    ):
-        if merge:
-            self._check_merge_allowed()
+    def _check_add_weighted_adapter(
+        self, adapters: list[str], combination_type: str, svd_rank: int | None
+    ) -> tuple[str, int, str]:
+        """
+        Helper function to check if the arguments to add_weighted_adapter are valid and compatible with the underlying
+        model.
+        """
+        for adapter in adapters:
+            if adapter not in list(self.peft_config.keys()):
+                raise ValueError(f"Adapter {adapter} does not exist")
 
-        key_list = [key for key, _ in self.model.named_modules() if self.prefix not in key]
-        desc = "Unloading " + ("and merging " if merge else "") + "model"
-        for key in tqdm(key_list, disable=not progressbar, desc=desc):
-            try:
-                parent, target, target_name = _get_submodules(self.model, key)
-            except AttributeError:
-                continue
-            with onload_layer(target):
-                if hasattr(target, "base_layer"):
-                    if merge:
-                        target.merge(safe_merge=safe_merge, adapter_names=adapter_names)
-                    self._replace_module(parent, target_name, target.get_base_layer(), target)
-                elif isinstance(target, ModulesToSaveWrapper):
-                    # save any additional trainable modules part of `modules_to_save`
-                    new_module = target.modules_to_save[target.active_adapter]
-                    if hasattr(new_module, "base_layer"):
-                        # check if the module is itself a tuner layer
-                        if merge:
-                            new_module.merge(safe_merge=safe_merge, adapter_names=adapter_names)
-                        new_module = new_module.get_base_layer()
-                    setattr(parent, target_name, new_module)
+        for adapter in adapters:
+            if self.peft_config[adapter].target_parameters:
+                raise ValueError(
+                    f"add_weighted_adapter does not support targeting nn.Parameter (problematic adapter '{adapter}')"
+                )
+            if self.peft_config[adapter].use_dora:
+                raise ValueError(f"add_weighted_adapter does not support DoRA (problematic adapter '{adapter}')")
+            if self.peft_config[adapter].kasa_config is not None:
+                raise ValueError(f"add_weighted_adapter does not support KaSA (problematic adapter '{adapter}')")
 
-        return self.model
+        # the combined adapter needs lora_bias as soon as one source has it, but an embedding rejects it outright
+        bias_adapters = [adapter for adapter in adapters if self.peft_config[adapter].lora_bias]
+        if bias_adapters:
+            embedding_modules = [module for module in self.modules() if isinstance(module, Embedding)]
+            embedding_adapters = [
+                adapter
+                for adapter in adapters
+                if any(adapter in module.lora_embedding_A for module in embedding_modules)
+            ]
+            if embedding_adapters:
+                raise ValueError(
+                    f"add_weighted_adapter does not support lora_bias combined with nn.Embedding targeting: adapters "
+                    f"{bias_adapters} use lora_bias=True while adapters {embedding_adapters} target an nn.Embedding, "
+                    f"which does not support a bias. Leave either group out of the call."
+                )
+
+        # If more than one of the adapters targets the same module with modules_to_save, raise an error, as these
+        # modules cannot be merged. First, find the ModulesToSaveWrapper instances in the model, then check if they
+        # have modules for the adapters to be merged.
+        modules_to_save_wrappers = [module for module in self.modules() if isinstance(module, ModulesToSaveWrapper)]
+        problematic_wrappers = [
+            wrapper
+            for wrapper in modules_to_save_wrappers
+            if sum(adapter in wrapper.modules_to_save for adapter in adapters) > 1
+        ]
+        if problematic_wrappers:
+            raise ValueError(
+                "Cannot add weighted adapters if they target the same module with modules_to_save, but found "
+                f"{len(problematic_wrappers)} such instance(s)."
+            )
+
+        # if there is only one adapter, we can only use linear merging
+        combination_type = "linear" if len(adapters) == 1 else combination_type
+
+        adapters_ranks: list[int] = [
+            # When allocating tensors for the new adapter, we need the maximum possible rank to not overflow
+            config.r if not config.rank_pattern else max(config.r, *config.rank_pattern.values())
+            for config in (self.peft_config[adapter] for adapter in adapters)
+        ]
+
+        if combination_type in ("linear", "ties", "dare_ties", "dare_linear", "magnitude_prune"):
+            # all adapters ranks should be same, new rank is just this value
+            if len(set(adapters_ranks)) != 1:
+                raise ValueError(
+                    "All adapters must have the same r value when using combination_type linear, ties, dare_ties or "
+                    "dare_linear."
+                )
+            new_rank = adapters_ranks[0]
+        elif combination_type == "cat":
+            # adapters ranks may be different, new rank is sum of all ranks
+            # be careful, because output adapter rank may be really big if mixing a lot of adapters
+            new_rank = sum(adapters_ranks)
+        elif combination_type.endswith("svd"):
+            # new rank is the max of all ranks of the adapters if not provided
+            new_rank = svd_rank or max(adapters_ranks)
+        else:
+            raise ValueError(f"Invalid combination_type: {combination_type}")
+
+        target_module_types = [type(self.peft_config[adapter].target_modules) for adapter in adapters]
+        if not target_module_types:
+            raise ValueError(f"Found no adapter matching the names in {adapters}")
+        if len(set(target_module_types)) > 1:
+            raise ValueError(
+                "all adapter configs should follow the same target modules type. "
+                "Combining adapters with `target_modules` type being a mix of list/set and string is not supported."
+            )
+
+        if target_module_types[0] is str:
+            new_target_modules = "|".join(f"({self.peft_config[adapter].target_modules})" for adapter in adapters)
+        elif target_module_types[0] is set:
+            new_target_modules = reduce(
+                operator.or_, (self.peft_config[adapter].target_modules for adapter in adapters)
+            )
+        else:
+            raise TypeError(f"Invalid type {target_module_types[0]} found in target_modules")
+
+        return combination_type, new_rank, new_target_modules
 
     def add_weighted_adapter(
         self,
-        adapters,
-        weights,
-        adapter_name,
-        combination_type="svd",
-        svd_rank=None,
-        svd_clamp=None,
-        svd_full_matrices=True,
-        svd_driver=None,
-        density=None,
+        adapters: list[str],
+        weights: list[float],
+        adapter_name: str,
+        combination_type: Literal[
+            "svd",
+            "linear",
+            "cat",
+            "ties",
+            "ties_svd",
+            "dare_ties",
+            "dare_linear",
+            "dare_ties_svd",
+            "dare_linear_svd",
+            "magnitude_prune",
+            "magnitude_prune_svd",
+        ] = "svd",
+        svd_rank: int | None = None,
+        svd_clamp: int | None = None,
+        svd_full_matrices: bool = True,
+        svd_driver: str | None = None,
+        density: float | None = None,
         majority_sign_method: Literal["total", "frequency"] = "total",
     ) -> None:
         """
@@ -473,14 +816,17 @@ class LoraModel(BaseTuner):
             adapters (`list`):
                 List of adapter names to be merged.
             weights (`list`):
-                List of weights for each adapter.
+                List of weights for each adapter. Weights can be positive or negative, allowing for both addition and
+                subtraction of adapter effects.
             adapter_name (`str`):
                 Name of the new adapter.
             combination_type (`str`):
                 The merging type can be one of [`svd`, `linear`, `cat`, `ties`, `ties_svd`, `dare_ties`, `dare_linear`,
                 `dare_ties_svd`, `dare_linear_svd`, `magnitude_prune`, `magnitude_prune_svd`]. When using the `cat`
                 combination_type, the rank of the resulting adapter is equal to the sum of all adapters ranks (the
-                mixed adapter may be too big and result in OOM errors).
+                mixed adapter may be too big and result in OOM errors). Note that `cat` and `svd` are precise methods
+                and will give you good accuracy, `linear` is efficient but a very rough approximation and should be
+                avoided if you can afford it.
             svd_rank (`int`, *optional*):
                 Rank of output adapter for svd. If None provided, will use max rank of merging adapters.
             svd_clamp (`float`, *optional*):
@@ -504,54 +850,25 @@ class LoraModel(BaseTuner):
 
         if adapter_name in list(self.peft_config.keys()):
             return
-        for adapter in adapters:
-            if adapter not in list(self.peft_config.keys()):
-                raise ValueError(f"Adapter {adapter} does not exist")
 
-        # if there is only one adapter, we can only use linear merging
-        combination_type = "linear" if len(adapters) == 1 else combination_type
+        combination_type, new_rank, new_target_modules = self._check_add_weighted_adapter(
+            adapters=adapters,
+            combination_type=combination_type,
+            svd_rank=svd_rank,
+        )
 
-        adapters_ranks = [self.peft_config[adapter].r for adapter in adapters]
-        if combination_type in ("linear", "ties", "dare_ties", "dare_linear", "magnitude_prune"):
-            # all adapters ranks should be same, new rank is just this value
-            if len(set(adapters_ranks)) != 1:
-                raise ValueError(
-                    "All adapters must have the same r value when using combination_type linear, ties, dare_ties or dare_linear."
-                )
-            new_rank = adapters_ranks[0]
-        elif combination_type == "cat":
-            # adapters ranks may be different, new rank is sum of all ranks
-            # be careful, because output adapter rank may be really big if mixing a lot of adapters
-            new_rank = sum(adapters_ranks)
-        elif combination_type.endswith("svd"):
-            # new rank is the max of all ranks of the adapters if not provided
-            new_rank = svd_rank or max(adapters_ranks)
-        else:
-            raise ValueError(f"Invalid combination_type: {combination_type}")
-
-        target_module_types = [type(self.peft_config[adapter].target_modules) for adapter in adapters]
-        if not target_module_types:
-            raise ValueError(f"Found no adapter matching the names in {adapters}")
-        if len(set(target_module_types)) > 1:
-            raise ValueError(
-                "all adapter configs should follow the same target modules type. "
-                "Combining adapters with `target_modules` type being a mix of list/set and string is not supported."
-            )
-
-        if target_module_types[0] == str:
-            new_target_modules = "|".join(f"({self.peft_config[adapter].target_modules})" for adapter in adapters)
-        elif target_module_types[0] == set:
-            new_target_modules = reduce(
-                operator.or_, (self.peft_config[adapter].target_modules for adapter in adapters)
-            )
-        else:
-            raise TypeError(f"Invalid type {target_module_types[0]} found in target_modules")
-
+        # The scaling of each source adapter is already folded into the combined lora_A/lora_B weights below, so the
+        # new adapter must have a scaling of exactly 1. With lora_alpha == r this only holds when use_rslora=False
+        # (otherwise scaling would be r / sqrt(r) = sqrt(r)), so don't inherit use_rslora from adapters[0].
         self.peft_config[adapter_name] = replace(
             self.peft_config[adapters[0]],
             r=new_rank,
             lora_alpha=new_rank,
+            use_rslora=False,
+            lora_bias=any(self.peft_config[adapter].lora_bias for adapter in adapters),
             target_modules=new_target_modules,
+            alpha_pattern={},
+            rank_pattern={},
         )
         self.inject_adapter(self.model, adapter_name)
 
@@ -619,6 +936,14 @@ class LoraModel(BaseTuner):
                         combination_type, adapters, weights, target, density, majority_sign_method
                     )
 
+                if target.lora_bias[adapter_name]:
+                    # the bias adds to the output independently of the lora_A/lora_B factorization
+                    new_bias = torch.zeros_like(target.lora_B[adapter_name].bias)
+                    for adapter, weight in zip(adapters, weights):
+                        if adapter in target.lora_B and target.lora_bias[adapter]:
+                            new_bias += weight * target.scaling[adapter] * target.lora_B[adapter].bias.data
+                    target.lora_B[adapter_name].bias.data = new_bias
+
     def _svd_generalized_task_arithmetic_weighted_adapter(
         self,
         combination_type,
@@ -640,11 +965,12 @@ class LoraModel(BaseTuner):
         for adapter, weight in zip(adapters, weights):
             if adapter in target.lora_A or adapter in target.lora_embedding_A:
                 valid_adapters.append(adapter)
-                valid_weights.append(weight * target.scaling[adapter])
+                valid_weights.append(weight)
 
         # if no valid adapter, nothing to do
         if len(valid_adapters) == 0:
-            raise ValueError("No matching LoRAs found. Please raise an issue on Github.")
+            raise ValueError("No matching LoRAs found. Please raise an issue on GitHub.")
+        # get_delta_weight applies the scaling, no need to handle it explicitly
         delta_weight = [target.get_delta_weight(adapter) for adapter in valid_adapters]
         valid_weights = torch.tensor(valid_weights).to(delta_weight[0].device)
         if combination_type == "svd":
@@ -660,13 +986,10 @@ class LoraModel(BaseTuner):
         else:
             raise ValueError(f"Invalid value passed to combination type: {combination_type}")
 
-        conv2d = isinstance(target, Conv2d)
-        if conv2d:
-            conv2d_1x1 = target.weight.size()[2:4] == (1, 1)
-            if not conv2d_1x1:
-                delta_weight = delta_weight.flatten(start_dim=1)
-            else:
-                delta_weight = delta_weight.squeeze()
+        is_conv = isinstance(target, _ConvNd)
+        if is_conv:
+            # (out, in, *kernel) -> (out, in * prod(kernel)), works for Conv1d, Conv2d (incl. 1x1) and Conv3d
+            delta_weight = delta_weight.flatten(start_dim=1)
         if (hasattr(target, "fan_in_fan_out") and target.fan_in_fan_out) or is_embedding:
             delta_weight = delta_weight.T
 
@@ -682,7 +1005,7 @@ class LoraModel(BaseTuner):
             low_val = -hi_val
             U = U.clamp(low_val, hi_val)
             Vh = Vh.clamp(low_val, hi_val)
-        if conv2d:
+        if is_conv:
             U = U.reshape(target_lora_B.data.shape)
             Vh = Vh.reshape(target_lora_A.data.shape)
         return Vh, U
@@ -697,7 +1020,8 @@ class LoraModel(BaseTuner):
         majority_sign_method,
     ):
         # account weights for LoRA A and B layers.
-        valid_weights = []
+        valid_weights_A = []
+        valid_weights_B = []
         lora_A_deltas = []
         lora_B_deltas = []
         for adapter, weight in zip(adapters, weights):
@@ -709,85 +1033,374 @@ class LoraModel(BaseTuner):
                 current_adapter_lora_B = target.lora_embedding_B[adapter]
             else:
                 continue
-            valid_weights.append(math.sqrt(weight * target.scaling[adapter]))
+            # Support negative weights: take absolute value for sqrt, then apply sign
+            weight_with_scaling = weight * target.scaling[adapter]
+            sign = 1 if weight_with_scaling >= 0 else -1
+            # apply sign only on one side of the weights, otherwise negative signs negate
+            valid_weights_A.append(math.sqrt(abs(weight_with_scaling)) * sign)
+            valid_weights_B.append(math.sqrt(abs(weight_with_scaling)))
             lora_A_deltas.append(current_adapter_lora_A.data)
             lora_B_deltas.append(current_adapter_lora_B.data)
-        valid_weights = torch.tensor(valid_weights).to(lora_A_deltas[0].device)
+        valid_weights_A = torch.tensor(valid_weights_A).to(lora_A_deltas[0].device)
+        valid_weights_B = torch.tensor(valid_weights_B).to(lora_B_deltas[0].device)
+        valid_weights = [valid_weights_A, valid_weights_B]
         lora_deltas = [lora_A_deltas, lora_B_deltas]
         dtype = lora_A_deltas[0].dtype
         for i, task_tensors in enumerate(lora_deltas):
             if combination_type == "linear":
-                lora_deltas[i] = task_arithmetic(task_tensors, valid_weights)
+                lora_deltas[i] = task_arithmetic(task_tensors, valid_weights[i])
             elif combination_type == "ties":
-                lora_deltas[i] = ties(task_tensors, valid_weights, density, majority_sign_method)
+                lora_deltas[i] = ties(task_tensors, valid_weights[i], density, majority_sign_method)
             elif combination_type == "dare_linear":
-                lora_deltas[i] = dare_linear(task_tensors, valid_weights, density)
+                lora_deltas[i] = dare_linear(task_tensors, valid_weights[i], density)
             elif combination_type == "dare_ties":
-                lora_deltas[i] = dare_ties(task_tensors, valid_weights, density, majority_sign_method)
+                lora_deltas[i] = dare_ties(task_tensors, valid_weights[i], density, majority_sign_method)
             elif combination_type == "magnitude_prune":
-                lora_deltas[i] = magnitude_prune(task_tensors, valid_weights, density)
+                lora_deltas[i] = magnitude_prune(task_tensors, valid_weights[i], density)
             else:
                 raise ValueError("Invalid combination type")
         lora_deltas = [delta.to(dtype) for delta in lora_deltas]
         return lora_deltas
 
-    def delete_adapter(self, adapter_name: str) -> None:
-        """
-        Deletes an existing adapter.
-
-        Args:
-            adapter_name (str): Name of the adapter to be deleted.
-        """
-        if adapter_name not in list(self.peft_config.keys()):
-            raise ValueError(f"Adapter {adapter_name} does not exist")
-        del self.peft_config[adapter_name]
-
-        key_list = [key for key, _ in self.model.named_modules() if self.prefix not in key]
-        new_adapter = None
-        for key in key_list:
-            _, target, _ = _get_submodules(self.model, key)
-            if isinstance(target, LoraLayer):
-                target.delete_adapter(adapter_name)
-                if new_adapter is None:
-                    new_adapter = target.active_adapters[:]
-
-        self.active_adapter = new_adapter or []
-
-    def merge_and_unload(
-        self, progressbar: bool = False, safe_merge: bool = False, adapter_names: Optional[list[str]] = None
-    ) -> torch.nn.Module:
+    def subtract_mutated_init(self, output_state_dict: dict[str, torch.Tensor], adapter_name: str, kwargs=None):
         r"""
-        This method merges the LoRa layers into the base model. This is needed if someone wants to use the base model
-        as a standalone model.
+        This function can calculate the updates of PiSSA/CorDA/OLoRA by comparing the parameters of the
+        PiSSA/CorDA/OLoRA adapter in `output_state_dict` with the initial values of PiSSA/CorDA/OLoRA in
+        `adapter_name`, thus converting PiSSA/CorDA/OLoRA to LoRA.
 
-        Args:
-            progressbar (`bool`):
-                whether to show a progressbar indicating the unload and merge process
-            safe_merge (`bool`):
-                whether to activate the safe merging check to check if there is any potential Nan in the adapter
-                weights
-            adapter_names (`List[str]`, *optional*):
-                The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
-                to `None`.
-        Example:
+        Methods like PiSSA remove a portion of the model base weights for training and therefore are not easily
+        swapped. But if you know both the initial pre-training and the post-training weights, you can compute the
+        \Delta W and use that as a LoRA adapter.
+
+        Compute steps:
+
+        - $W = W_{res} + A_0 B_0$ (PiSSA init)
+        - $W + \Delta W = W_{res} + A B$ (PiSSA after training)
+        - $\Delta W = W_{res} + AB - W = W_{res} + AB - W_{res} - A_0 B_0$ (Deriving dW for LoRA)
+        - $\Delta W = AB - A_0 B_0$
+        """
+        for name, param in self.model.named_parameters():
+            if (
+                param.data.dtype != torch.float32
+                and param.data.dtype != torch.float16
+                and param.data.dtype != torch.bfloat16
+            ) and adapter_name.startswith("pissa"):
+                warnings.warn(
+                    r"Note that Quant(W_res) + AB != Quant(W) + \Delta(AB); "
+                    "the converted LoRA, when combined with W or Quant(W), may introduce a certain gap in the fine-tuned model. "
+                    "Therefore, we recommend directly using the Quant(W_res) in conjunction with the PiSSA adapter. "
+                )
+        mutated_init_state_dict = get_peft_model_state_dict(
+            self,
+            state_dict=kwargs.get("state_dict", None),
+            adapter_name=adapter_name,
+        )
+        tensors_lora = {}
+        for name in output_state_dict.keys():
+            ## W = W^{res} + A_0 \times B_0,
+            ## W + \Delta W = W^{res} + A \times B,
+            ## \Delta W = A \times B - A_0 \times B_0 = [A | A_0] \times [B | -B_0]^T = A'B'.
+            if "lora_A" in name:
+                tensors_lora[name] = torch.cat(
+                    [output_state_dict[name], mutated_init_state_dict[".".join(name.split(".")[1:])]], dim=0
+                )
+            elif "lora_B" in name:
+                tensors_lora[name] = torch.cat(
+                    [output_state_dict[name], -mutated_init_state_dict[".".join(name.split(".")[1:])]], dim=1
+                )
+
+        return tensors_lora
+
+    @classmethod
+    def _get_adapter_state_dict(cls, model, config, adapter_name, state_dict, unwanted_adapter_names):
+        to_return = super()._get_adapter_state_dict(model, config, adapter_name, state_dict, unwanted_adapter_names)
+
+        if config.use_dora:
+            # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
+            # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer. Since
+            # we want the state_dict format not to change, we remove the "weight" part.
+            new_dora_suffix = f"lora_magnitude_vector.{adapter_name}.weight"
+
+            def renamed_dora_weights(k):
+                if k.endswith(new_dora_suffix):
+                    k = k[:-7]  # remove ".weight"
+                return k
+
+            to_return = {renamed_dora_weights(k): v for k, v in to_return.items()}
+        return to_return
+
+    @classmethod
+    def _remap_adapter_state_dict_for_load(cls, model, config, adapter_name, state_dict):
+        # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
+        # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer. As the
+        # checkpoint format did not change (the keys still end with lora_magnitude_vector, without ".weight"), the
+        # suffix needs to be appended before the keys are remapped to the model format.
+        def renamed_dora_weights(k):
+            if k.endswith("lora_magnitude_vector"):
+                k = k + ".weight"
+            return k
+
+        state_dict = {renamed_dora_weights(k): v for k, v in state_dict.items()}
+        peft_model_state_dict = super()._remap_adapter_state_dict_for_load(model, config, adapter_name, state_dict)
+
+        # Before PEFT 0.22.0, the out_proj delta weight of MultiheadAttention was applied twice (#3774). To keep the
+        # outputs of these adapters unchanged, lora_B is doubled and the version is updated so this happens only once.
+        # Dev versions after 0.21.0 are not adjusted, since main stays on 0.21.x dev versions after the fix; otherwise,
+        # adapters saved from main would be doubled each time they are loaded. A config without peft_version is from
+        # before PEFT 0.18.0 and is adjusted too.
+        suffix = f".base_layer.out_proj.lora_B.{adapter_name}.weight"
+        out_proj_keys = [
+            key
+            for key in peft_model_state_dict
+            if key.endswith(suffix) and isinstance(model.get_submodule(key.removesuffix(suffix)), MultiheadAttention)
+        ]
+        if out_proj_keys:
+            peft_version = packaging.version.Version(config.peft_version.partition("@")[0])
+            release = packaging.version.Version(peft_version.base_version)
+            needs_doubling = (
+                getattr(config, "_peft_version_missing", False)
+                or release < packaging.version.Version("0.21.1")
+                or (not peft_version.is_devrelease and release < packaging.version.Version("0.22.0"))
+            )
+            if needs_doubling:
+                for key in out_proj_keys:
+                    peft_model_state_dict[key] = 2 * peft_model_state_dict[key]
+                config.peft_version = config._get_peft_version()
+                config._peft_version_missing = False
+                warnings.warn(
+                    f"Adapter '{adapter_name}' was saved with PEFT < 0.22.0, which applied the out_proj LoRA weights "
+                    "of MultiheadAttention twice. They were doubled to keep the outputs of the adapter unchanged."
+                )
+
+        if not is_transformers_dtensor_tp and torch.distributed.is_available() and torch.distributed.is_initialized():
+            _maybe_shard_state_dict_for_tp(model, peft_model_state_dict, adapter_name)
+
+        return peft_model_state_dict
+
+    @classmethod
+    def _convert_state_dict_for_initial_model(
+        cls, peft_model, peft_config, path_initial_model_for_weight_conversion, output_state_dict, kwargs
+    ):
+        if peft_config.use_rslora and (peft_config.rank_pattern or peft_config.alpha_pattern):
+            msg = (
+                "Passing `path_initial_model_for_weight_conversion` to `save_pretrained` is not supported when "
+                "using `rank_pattern` or `alpha_pattern` at the same time as `use_rslora=True`."
+            )
+            raise ValueError(msg)
+
+        if not any(
+            str(peft_config.init_lora_weights).lower().startswith(prefix)
+            for prefix in ["pissa", "corda", "astra", "olora", "lora_ga", "true"]
+        ):
+            warnings.warn(
+                "`path_initial_model_for_weight_conversion` only works for converting a "
+                "PiSSA/CorDA/Astra/OLoRA/LoRA-GA adapter to a LoRA adapter"
+            )
+
+        initial_adapter_name = os.path.basename(path_initial_model_for_weight_conversion)
+        try:
+            peft_model.load_adapter(
+                os.path.dirname(path_initial_model_for_weight_conversion),
+                subfolder=initial_adapter_name,
+                adapter_name=initial_adapter_name,
+            )
+            is_pissa = str(peft_model.peft_config[initial_adapter_name].init_lora_weights).lower().startswith("pissa")
+            is_corda = str(peft_model.peft_config[initial_adapter_name].init_lora_weights).lower() == "corda"
+            is_astra = str(peft_model.peft_config[initial_adapter_name].init_lora_weights).lower() == "astra"
+            is_olora = str(peft_model.peft_config[initial_adapter_name].init_lora_weights).lower() == "olora"
+            is_lora_ga = str(peft_model.peft_config[initial_adapter_name].init_lora_weights).lower() == "lora_ga"
+            if is_pissa or is_corda or is_astra or is_olora or is_lora_ga:
+                raise ValueError(
+                    "The `init_lora_weights` parameter of the initial adapter should be set to `True`. "
+                    "Otherwise, `self.load_adapter` will subtract the decomposed values again based on the "
+                    "residual model."
+                )
+            output_state_dict = peft_model.base_model.subtract_mutated_init(
+                output_state_dict, initial_adapter_name, kwargs
+            )
+        finally:
+            peft_model.delete_adapter(initial_adapter_name)
+        return output_state_dict
+
+    def _get_monteclora_loss(self, adapter_names: Optional[Union[str, list[str]]] = None) -> torch.Tensor | float:
+        """
+        Compute the MonteCLoRA variational regularization loss.
+
+        Iterates over all `LoraLayer` modules in the model and, for each layer, collects the KL-divergence and entropy
+        components from the `MontecloraSampler`s that correspond to the requested adapters. The aggregated loss is
+        normalized by the number of contributing samplers. Returns `0.0` if no matching MonteCLoRA samplers are present
+        (e.g. MonteCLoRA is not used, or none of the requested adapters use MonteCLoRA).
+
+        Only samplers belonging to `adapter_names` are considered. This matters when multiple LoRA adapters are
+        attached to the model but only a subset is active: the regularization loss is then computed only for those
+        adapters. By default (`adapter_names=None`) the model's currently active adapters are used.
+
+        Typical usage during training (after computing the task loss):
 
         ```py
-        >>> from transformers import AutoModelForCausalLM
-        >>> from peft import PeftModel
-
-        >>> base_model = AutoModelForCausalLM.from_pretrained("tiiuae/falcon-40b")
-        >>> peft_model_id = "smangrul/falcon-40B-int4-peft-lora-sfttrainer-sample"
-        >>> model = PeftModel.from_pretrained(base_model, peft_model_id)
-        >>> merged_model = model.merge_and_unload()
+        task_loss = ...  # standard loss from the model
+        monteclora_loss = model._get_monteclora_loss()
+        total_loss = task_loss + monteclora_loss
         ```
-        """
-        return self._unload_and_optionally_merge(
-            progressbar=progressbar, safe_merge=safe_merge, adapter_names=adapter_names
-        )
 
-    def unload(self) -> torch.nn.Module:
+        Args:
+            adapter_names (`str` or `list[str]`, *optional*):
+                Name(s) of the adapter(s) to include in the loss computation. If `None` (the default), the model's
+                currently active adapters (`self.active_adapters`) are used.
+
+        Returns:
+            The normalized variational loss as a tensor (or `0.0` if no matching MonteCLoRA samplers are present).
         """
-        Gets back the base model by removing all the lora modules without merging. This gives back the original base
-        model.
+        if adapter_names is None:
+            adapter_names = self.active_adapters
+        elif isinstance(adapter_names, str):
+            adapter_names = [adapter_names]
+
+        var_loss_sum: torch.Tensor | float = 0.0
+        num_monte_layers = 0
+        for module in self.modules():
+            if not isinstance(module, LoraLayer):
+                continue
+            samplers = getattr(module, "lora_monteclora_sampler", None)
+            if samplers is None:
+                continue
+            for adapter_name in adapter_names:
+                if adapter_name not in samplers:
+                    continue
+                kl_loss, entropy_loss = samplers[adapter_name].get_variational_loss()
+                var_loss_sum = var_loss_sum + kl_loss + entropy_loss
+                num_monte_layers += 1
+
+        if num_monte_layers == 0:
+            return 0.0
+        return var_loss_sum / num_monte_layers
+
+    def _get_kasa_loss(self, adapter_names: Optional[Union[str, list[str]]] = None) -> torch.Tensor | float:
         """
-        return self._unload_and_optionally_merge(merge=False)
+        Compute the KaSA auxiliary regularization loss summed over all KaSA-adapted layers.
+
+        The KaSA paper (https://huggingface.co/papers/2412.06071) optimizes the task loss together with two auxiliary
+        terms (Eq. 9-12): an L2 penalty on the learnable singular values `sum(lora_diag ** 2)` (weighted by `beta`) and
+        an orthogonal regularization `||B^T B - I||_F + ||A A^T - I||_F` on the adapter factors (weighted by `gamma`),
+        which softly enforces the semi-orthogonality assumed by the SVD parametrization. The coefficients are taken
+        from the `KasaConfig` of each adapter. Returns `0.0` if no matching KaSA layers are present (e.g. KaSA is not
+        used, or none of the requested adapters use KaSA).
+
+        Typical usage during training (after computing the task loss):
+
+        ```py
+        task_loss = ...  # standard loss from the model
+        kasa_loss = model._get_kasa_loss()
+        total_loss = task_loss + kasa_loss
+        ```
+
+        Args:
+            adapter_names (`str` or `list[str]`, *optional*):
+                Name(s) of the adapter(s) to include in the loss computation. If `None` (the default), the model's
+                currently active adapters (`self.active_adapters`) are used.
+
+        Returns:
+            The summed regularization loss as a tensor (or `0.0` if no KaSA layers match).
+        """
+        from .variants import _kasa_layer_regularization_loss
+
+        if adapter_names is None:
+            adapter_names = self.active_adapters
+        elif isinstance(adapter_names, str):
+            adapter_names = [adapter_names]
+
+        total: torch.Tensor | float = 0.0
+        for module in self.modules():
+            if not isinstance(module, LoraLayer):
+                continue
+            lora_diag = getattr(module, "lora_diag", None)
+            if lora_diag is None:
+                continue
+            for adapter_name in adapter_names:
+                if adapter_name not in lora_diag:
+                    continue
+                kasa_config = self.peft_config[adapter_name].kasa_config
+                layer_loss = _kasa_layer_regularization_loss(
+                    module, adapter_name=adapter_name, beta=kasa_config.beta, gamma=kasa_config.gamma
+                )
+                total = total + layer_loss
+
+        return total
+
+    def _add_modules_to_save_to_tie(self, peft_config: LoraConfig, tied_weight_keys: list[str]):
+        """
+        Add embedding layer to `modules_to_save` and remove rest of the tied layers from `module_to_save`. Maintain a
+        separate set for layers to be tied in `peft_config.tied_weights_keys`.
+
+        Args:
+            peft_config (LoraConfig) -- The configuration of the Lora model.
+            tied_weight_keys (list[str]) -- Contains the layers tied to the embedding layer.
+        """
+        tied_weight_keys = set(tied_weight_keys)
+        peft_config.modules_to_tie = tied_weight_keys
+
+        modules_to_save = getattr(peft_config, "modules_to_save", []) or []
+        embed_layer_name = find_parameter_name_by_module(self.model, self.model.get_input_embeddings())
+
+        # the layer may already be included but we assume that adding the same module twice is not a problem
+        if embed_layer_name not in modules_to_save:
+            modules_to_save.append(embed_layer_name)
+
+        # Iterate over `tied_weight_keys` which are
+        # fully qualified keys and remove matching keys from
+        # `modules_to_save`. It will only remove first encounter
+        # in `module_to_save`, which should be safe, because `tied_weight_keys`
+        # is a unique set of keys. These keys are removed because all the
+        # tied keys are handled in a separate flow
+        # outside of the usual `modules_to_save` flow
+        # See: peft.utils.other.set_additional_trainable_modules for details
+        for key in tied_weight_keys:
+            for m in modules_to_save:
+                if re.match(rf"(^|.*\.){m}($|\..*)", key):
+                    modules_to_save.remove(m)
+                    break
+
+        peft_config.modules_to_save = modules_to_save
+
+    def _add_targets_to_tie(self, peft_config: LoraConfig, tied_weight_keys: list[str]):
+        """
+        Add embedding layer to `target_modules` and remove rest of the tied layers from `target_modules`. Maintain a
+        separate set for layers to be tied in `peft_config.target_modules_to_tie`
+
+        Args:
+            peft_config (LoraConfig) -- The configuration of the Lora model.
+            tied_weight_keys (list[str]) -- Contains the layers tied to the embedding layer.
+        """
+        tied_weight_keys = set(tied_weight_keys)
+        peft_config.target_modules_to_tie = tied_weight_keys
+
+        raw_target_modules = getattr(peft_config, "target_modules", None)
+
+        embed_layer_name = find_parameter_name_by_module(self.model, self.model.get_input_embeddings())
+
+        if isinstance(raw_target_modules, str):
+            # The way weight tying is handled for adapters, we always want to add
+            # lora adapters to the input embedding layer (embed_tokens)
+            # instead of output embedding layer.
+            raw_target_modules = rf"(?:{raw_target_modules}|^{re.escape(embed_layer_name)}$)"
+            peft_config.target_modules = raw_target_modules
+            return
+
+        target_modules = set(raw_target_modules or [])
+        target_modules.add(embed_layer_name)
+
+        # Iterate over `tied_weight_keys` which are
+        # fully qualified keys and remove matching keys from
+        # `target_modules`. It will only remove first encounter
+        # in `target_modules`, which should be safe, because `tied_weight_keys`
+        # is a unique set of keys. These keys are removed because all the
+        # tied keys are handled in a separate flow
+        # outside of the usual `target_modules` flow
+        # See: peft.tuners.tuners_utils.BaseTuner.inject_adapter for details
+        for key in tied_weight_keys:
+            for m in target_modules:
+                if re.match(rf"(^|.*\.){m}($|\..*)", key):
+                    target_modules.remove(m)
+                    break
+
+        peft_config.target_modules = target_modules

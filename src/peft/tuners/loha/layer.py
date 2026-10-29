@@ -13,13 +13,15 @@
 # limitations under the License.
 
 import math
-from typing import Any, Set, Tuple
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from peft.tuners.lycoris_utils import LycorisLayer
+
+from .config import LoHaConfig
 
 
 class LoHaLayer(nn.Module, LycorisLayer):
@@ -40,12 +42,12 @@ class LoHaLayer(nn.Module, LycorisLayer):
         self.hada_t2 = nn.ParameterDict({})
 
     @property
-    def _available_adapters(self) -> Set[str]:
+    def _available_adapters(self) -> set[str]:
         return {*self.hada_w1_a, *self.hada_w1_b, *self.hada_w2_a, *self.hada_w2_b, *self.hada_t1, *self.hada_t2}
 
-    def create_adapter_parameters(self, adapter_name: str, r: int, shape: Tuple[int, ...]):
+    def create_adapter_parameters(self, adapter_name: str, r: int, shape: tuple[int, ...]):
         # https://github.com/KohakuBlueleaf/LyCORIS/blob/eb460098187f752a5d66406d3affade6f0a07ece/lycoris/modules/loha.py#L130C9-L143C75
-        if len(shape) == 4:
+        if len(shape) == 4:  # Conv2d
             self.hada_t1[adapter_name] = nn.Parameter(torch.empty(r, r, shape[2], shape[3]))
             self.hada_w1_a[adapter_name] = nn.Parameter(torch.empty(r, shape[0]))  # out_dim, 1-mode
             self.hada_w1_b[adapter_name] = nn.Parameter(torch.empty(r, shape[1]))  # in_dim , 2-mode
@@ -53,7 +55,15 @@ class LoHaLayer(nn.Module, LycorisLayer):
             self.hada_t2[adapter_name] = nn.Parameter(torch.empty(r, r, shape[2], shape[3]))
             self.hada_w2_a[adapter_name] = nn.Parameter(torch.empty(r, shape[0]))  # out_dim, 1-mode
             self.hada_w2_b[adapter_name] = nn.Parameter(torch.empty(r, shape[1]))  # in_dim , 2-mode
-        else:
+        elif len(shape) == 3:  # Conv1d
+            self.hada_t1[adapter_name] = nn.Parameter(torch.empty(r, r, shape[2], 1))
+            self.hada_w1_a[adapter_name] = nn.Parameter(torch.empty(r, shape[0]))  # out_dim, 1-mode
+            self.hada_w1_b[adapter_name] = nn.Parameter(torch.empty(r, shape[1]))  # in_dim , 2-mode
+
+            self.hada_t2[adapter_name] = nn.Parameter(torch.empty(r, r, shape[2], 1))
+            self.hada_w2_a[adapter_name] = nn.Parameter(torch.empty(r, shape[0]))  # out_dim, 1-mode
+            self.hada_w2_b[adapter_name] = nn.Parameter(torch.empty(r, shape[1]))  # in_dim , 2-mode
+        else:  # Linear
             self.hada_w1_a[adapter_name] = nn.Parameter(torch.empty(shape[0], r))
             self.hada_w1_b[adapter_name] = nn.Parameter(torch.empty(r, shape[1]))
 
@@ -95,10 +105,7 @@ class LoHaLayer(nn.Module, LycorisLayer):
         adapter_name: str,
         r: int,
         alpha: float,
-        rank_dropout: float,
-        module_dropout: float,
-        init_weights: bool,
-        use_effective_conv2d: bool = False,
+        config: LoHaConfig,
         **kwargs,
     ) -> None:
         """Internal function to create loha adapter
@@ -107,12 +114,14 @@ class LoHaLayer(nn.Module, LycorisLayer):
             adapter_name (`str`): Name for the adapter to add.
             r (`int`): Rank for the added adapter.
             alpha (`float`): Alpha for the added adapter.
-            rank_dropout (`float`): The dropout probability for rank dimension during training.
-            module_dropout (`float`): The dropout probability for disabling adapter during training.
-            init_weights (`bool`): Whether to initialize weights.
-            use_effective_conv2d (`bool`, *optional*, defaults to `False`):
-                Use parameter effective decomposition for Conv2d with ksize > 1.
+            config (`LoHaConfig`): The adapter configuration for this layer.
         """
+        rank_dropout = config.rank_dropout
+        module_dropout = config.module_dropout
+        init_weights = config.init_weights
+        use_effective_conv2d = config.use_effective_conv2d
+        inference_mode = config.inference_mode
+
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
@@ -127,13 +136,33 @@ class LoHaLayer(nn.Module, LycorisLayer):
         if isinstance(base_layer, nn.Linear):
             shape = tuple(base_layer.weight.shape)
         elif isinstance(base_layer, nn.Conv2d):
+            # For 1x1 convolutions, disable effective_conv2d to avoid unnecessary tensor reshaping overhead.
+            # Since 1x1 convolutions are essentially pointwise operations (matrix multiplications),
+            # they can be more efficiently handled with the flattened weight representation,
+            # similar to how Linear layers work. This optimization reduces computational cost
+            # without affecting the mathematical equivalence of the operation.
             use_effective_conv2d = use_effective_conv2d and base_layer.kernel_size != (1, 1)
+            in_channels = base_layer.in_channels // base_layer.groups
             if use_effective_conv2d:
-                shape = (base_layer.out_channels, base_layer.in_channels, *base_layer.kernel_size)
+                shape = (base_layer.out_channels, in_channels, *base_layer.kernel_size)
             else:
                 shape = (
                     base_layer.out_channels,
-                    base_layer.in_channels * base_layer.kernel_size[0] * base_layer.kernel_size[1],
+                    in_channels * base_layer.kernel_size[0] * base_layer.kernel_size[1],
+                )
+        elif isinstance(base_layer, nn.Conv1d):
+            # For Conv1d with kernel_size=1, disable effective_conv2d for the same optimization reasons
+            # as 1x1 Conv2d. Kernel size 1 means no spatial/temporal context, making it equivalent
+            # to a Linear layer applied across the channel dimension. Using flattened representation
+            # avoids unnecessary reshaping and improves computational efficiency.
+            use_effective_conv2d = use_effective_conv2d and base_layer.kernel_size[0] != 1
+            in_channels = base_layer.in_channels // base_layer.groups
+            if use_effective_conv2d:
+                shape = (base_layer.out_channels, in_channels, base_layer.kernel_size[0])
+            else:
+                shape = (
+                    base_layer.out_channels,
+                    in_channels * base_layer.kernel_size[0],
                 )
         else:
             raise TypeError(f"LoHa is not implemented for base layers of type {type(base_layer).__name__}")
@@ -148,16 +177,10 @@ class LoHaLayer(nn.Module, LycorisLayer):
             self.reset_adapter_parameters_random(adapter_name)
 
         # Move new weights to device
-        weight = getattr(self.get_base_layer(), "weight", None)
-        if weight is not None:
-            # the layer is already completely initialized, this is an update
-            if weight.dtype.is_floating_point or weight.dtype.is_complex:
-                self.to(weight.device, dtype=weight.dtype)
-            else:
-                self.to(weight.device)
-        self.set_adapter(self.active_adapters)
+        self._move_adapter_to_device_of_base_layer(adapter_name)
+        self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
-    def get_delta_weight(self, adapter_name: str) -> torch.Tensor:
+    def get_delta_weight(self, adapter_name: str, *, apply_rank_dropout: bool = False) -> torch.Tensor:
         # https://github.com/KohakuBlueleaf/LyCORIS/blob/eb460098187f752a5d66406d3affade6f0a07ece/lycoris/modules/loha.py#L178
         if adapter_name in self.hada_t1.keys():
             weight = make_weight_cp(
@@ -179,11 +202,12 @@ class LoHaLayer(nn.Module, LycorisLayer):
             )
 
         base_layer = self.get_base_layer()
+
+        # Reshape to match base layer shape
         weight = weight.reshape(base_layer.weight.shape)
 
-        # Perform rank dropout during training - drop rows of addition weights
         rank_dropout = self.rank_dropout[adapter_name]
-        if self.training and rank_dropout:
+        if apply_rank_dropout:
             drop = (torch.rand(weight.size(0)) > rank_dropout).to(weight.dtype)
             drop = drop.view(-1, *[1] * len(weight.shape[1:])).to(weight.device)
             # TODO: Investigate if there should be a scaler like in normal dropout during training
@@ -227,26 +251,29 @@ class Linear(LoHaLayer):
     def __init__(
         self,
         base_layer: nn.Module,
-        adapter_name: str = "default",
+        adapter_name: str,
+        config: LoHaConfig,
         r: int = 0,
         alpha: float = 0.0,
-        rank_dropout: float = 0.0,
-        module_dropout: float = 0.0,
-        init_weights: bool = True,
         **kwargs,
     ):
         super().__init__(base_layer)
 
         # Create adapter and set it active
         self._active_adapter = adapter_name
-        self.update_layer(adapter_name, r, alpha, rank_dropout, module_dropout, init_weights, **kwargs)
+        self.update_layer(adapter_name, r, alpha, config=config, **kwargs)
 
     def _get_delta_activations(
         self, adapter_name: str, input: torch.Tensor, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
-        delta_weight = self.get_delta_weight(adapter_name)
+        apply_rank_dropout = self.training and bool(self.rank_dropout[adapter_name])
+        delta_weight = self.get_delta_weight(adapter_name, apply_rank_dropout=apply_rank_dropout)
+        input = self._cast_input_dtype(input, delta_weight.dtype)
         # don't add bias here, because the bias is already included in the output of the base_layer
         return F.linear(input, delta_weight)
+
+    def supports_lora_conversion(self, adapter_name: str = "default") -> bool:
+        return True
 
     def __repr__(self) -> str:
         rep = super().__repr__()
@@ -259,30 +286,67 @@ class Conv2d(LoHaLayer):
     def __init__(
         self,
         base_layer: nn.Module,
-        adapter_name: str = "default",
+        adapter_name: str,
+        config: LoHaConfig,
         r: int = 0,
         alpha: float = 0.0,
-        rank_dropout: float = 0.0,
-        module_dropout: float = 0.0,
-        use_effective_conv2d: bool = False,
-        init_weights: bool = True,
         **kwargs,
     ):
         super().__init__(base_layer)
 
         # Create adapter and set it active
         self._active_adapter = adapter_name
-        self.update_layer(
-            adapter_name, r, alpha, rank_dropout, module_dropout, init_weights, use_effective_conv2d, **kwargs
-        )
+        self.update_layer(adapter_name, r, alpha, config=config, **kwargs)
 
     def _get_delta_activations(
         self, adapter_name: str, input: torch.Tensor, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
-        delta_weight = self.get_delta_weight(adapter_name)
+        apply_rank_dropout = self.training and bool(self.rank_dropout[adapter_name])
+        delta_weight = self.get_delta_weight(adapter_name, apply_rank_dropout=apply_rank_dropout)
+        input = self._cast_input_dtype(input, delta_weight.dtype)
         # don't add bias here, because the bias is already included in the output of the base_layer
         base_layer = self.get_base_layer()
         return F.conv2d(
+            input,
+            delta_weight,
+            stride=base_layer.stride,
+            padding=base_layer.padding,
+            dilation=base_layer.dilation,
+            groups=base_layer.groups,
+        )
+
+    def __repr__(self) -> str:
+        rep = super().__repr__()
+        return "loha." + rep
+
+
+class Conv1d(LoHaLayer):
+    """LoHa implemented in Conv1d layer"""
+
+    def __init__(
+        self,
+        base_layer: nn.Module,
+        adapter_name: str,
+        config: LoHaConfig,
+        r: int = 0,
+        alpha: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__(base_layer)
+
+        # Create adapter and set it active
+        self._active_adapter = adapter_name
+        self.update_layer(adapter_name, r, alpha, config=config, **kwargs)
+
+    def _get_delta_activations(
+        self, adapter_name: str, input: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> torch.Tensor:
+        apply_rank_dropout = self.training and bool(self.rank_dropout[adapter_name])
+        delta_weight = self.get_delta_weight(adapter_name, apply_rank_dropout=apply_rank_dropout)
+        input = self._cast_input_dtype(input, delta_weight.dtype)
+        # don't add bias here, because the bias is already included in the output of the base_layer
+        base_layer = self.get_base_layer()
+        return F.conv1d(
             input,
             delta_weight,
             stride=base_layer.stride,
@@ -301,7 +365,7 @@ class Conv2d(LoHaLayer):
 
 class HadaWeight(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w1a, w1b, w2a, w2b, scale=torch.tensor(1)):
+    def forward(ctx, w1a, w1b, w2a, w2b, scale=torch.tensor(1)):  # noqa: B008
         ctx.save_for_backward(w1a, w1b, w2a, w2b, scale)
         diff_weight = ((w1a @ w1b) * (w2a @ w2b)) * scale
         return diff_weight
@@ -324,7 +388,7 @@ class HadaWeight(torch.autograd.Function):
 
 class HadaWeightCP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, t1, w1a, w1b, t2, w2a, w2b, scale=torch.tensor(1)):
+    def forward(ctx, t1, w1a, w1b, t2, w2a, w2b, scale=torch.tensor(1)):  # noqa: B008
         ctx.save_for_backward(t1, w1a, w1b, t2, w2a, w2b, scale)
 
         rebuild1 = torch.einsum("i j k l, j r, i p -> p r k l", t1, w1b, w1a)
@@ -334,32 +398,35 @@ class HadaWeightCP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        (t1, w1a, w1b, t2, w2a, w2b, scale) = ctx.saved_tensors
+        # The gradient of w1a (w2a) uses the intermediate tensor of its own factor, temp1 (temp2), as in the updated
+        # LyCORIS implementation:
+        # https://github.com/KohakuBlueleaf/LyCORIS/blob/4a6a333819356795d22170fe661a84f16b299b6b/lycoris/functional/loha.py#L45-L79
+        t1, w1a, w1b, t2, w2a, w2b, scale = ctx.saved_tensors
         grad_out = grad_out * scale
 
-        temp = torch.einsum("i j k l, j r -> i r k l", t2, w2b)
-        rebuild = torch.einsum("i j k l, i r -> r j k l", temp, w2a)
+        temp1 = torch.einsum("i j k l, j r -> i r k l", t1, w1b)
+        temp2 = torch.einsum("i j k l, j r -> i r k l", t2, w2b)
+        rebuild = torch.einsum("i j k l, i r -> r j k l", temp2, w2a)
 
         grad_w = rebuild * grad_out
         del rebuild
 
-        grad_w1a = torch.einsum("r j k l, i j k l -> r i", temp, grad_w)
+        grad_w1a = torch.einsum("r j k l, i j k l -> r i", temp1, grad_w)
         grad_temp = torch.einsum("i j k l, i r -> r j k l", grad_w, w1a.T)
-        del grad_w, temp
+        del grad_w
 
         grad_w1b = torch.einsum("i r k l, i j k l -> r j", t1, grad_temp)
         grad_t1 = torch.einsum("i j k l, j r -> i r k l", grad_temp, w1b.T)
         del grad_temp
 
-        temp = torch.einsum("i j k l, j r -> i r k l", t1, w1b)
-        rebuild = torch.einsum("i j k l, i r -> r j k l", temp, w1a)
+        rebuild = torch.einsum("i j k l, i r -> r j k l", temp1, w1a)
 
         grad_w = rebuild * grad_out
-        del rebuild
+        del rebuild, temp1
 
-        grad_w2a = torch.einsum("r j k l, i j k l -> r i", temp, grad_w)
+        grad_w2a = torch.einsum("r j k l, i j k l -> r i", temp2, grad_w)
         grad_temp = torch.einsum("i j k l, i r -> r j k l", grad_w, w2a.T)
-        del grad_w, temp
+        del grad_w, temp2
 
         grad_w2b = torch.einsum("i r k l, i j k l -> r j", t2, grad_temp)
         grad_t2 = torch.einsum("i j k l, j r -> i r k l", grad_temp, w2b.T)

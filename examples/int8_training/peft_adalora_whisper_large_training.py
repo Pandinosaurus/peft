@@ -5,10 +5,10 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from random import randint
-from typing import Any, Dict, List, Union
+from typing import Any, Union
 
 # datasets imports
 import datasets
@@ -26,7 +26,7 @@ from accelerate.logging import get_logger
 from datasets import Audio, DatasetDict, IterableDatasetDict, interleave_datasets, load_dataset
 
 # hf imports
-from huggingface_hub import Repository
+from huggingface_hub import HfApi
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (
@@ -38,7 +38,6 @@ from transformers import (
     set_seed,
 )
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
-from transformers.utils import get_full_repo_name
 
 # peft imports
 from peft import AdaLoraConfig, LoraConfig, PeftModel, get_peft_model
@@ -338,7 +337,7 @@ def load_model_hook(models, input_dir):
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
 
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, features: list[dict[str, Union[list[int], torch.Tensor]]]) -> dict[str, torch.Tensor]:
         # split inputs and labels since they have to be of different lengths and need different padding methods
         # first treat the audio inputs by simply returning torch tensors
         input_features = [{"input_features": feature["input_features"]} for feature in features]
@@ -375,8 +374,9 @@ def evaluation_loop(model, eval_dataloader, processor, normalizer, metric, force
     references = []
     normalized_predictions = []
     normalized_references = []
+    device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
     for _, batch in enumerate(tqdm(eval_dataloader)):
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device_type=device_type):
             with torch.no_grad():
                 generated_tokens = (
                     model.generate(
@@ -402,7 +402,7 @@ def evaluation_loop(model, eval_dataloader, processor, normalizer, metric, force
     eval_metrics = {"eval/wer": wer, "eval/normalized_wer": normalized_wer}
     if accelerator.get_tracker("wandb"):
         sample_size = min(len(predictions), 256)
-        ids = [randint(0, len(predictions) - 1) for p in range(0, sample_size)]
+        ids = [randint(0, len(predictions) - 1) for p in range(sample_size)]
         sample_predictions = [predictions[i] for i in ids]
         sample_references = [references[i] for i in ids]
         sample_normalized_predictions = [normalized_predictions[i] for i in ids]
@@ -450,11 +450,13 @@ def main():
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            repo = Repository(args.output_dir, clone_from=repo_name)
+            api = HfApi(token=args.hub_token)
+
+            # Create repo (repo_name from args or inferred)
+            repo_name = args.hub_model_id
+            if repo_name is None:
+                repo_name = Path(args.output_dir).absolute().name
+            repo_id = api.create_repo(repo_name, exist_ok=True).repo_id
 
             with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
                 if "step_*" not in gitignore:
@@ -486,14 +488,12 @@ def main():
         train_split = "train+validation"
         test_split = "test"
 
-    raw_datasets["train"] = loading_method(
-        args.dataset_name, args.language_abbr, split=train_split, use_auth_token=True
-    )
-    raw_datasets["test"] = loading_method(args.dataset_name, args.language_abbr, split=test_split, use_auth_token=True)
+    raw_datasets["train"] = loading_method(args.dataset_name, args.language_abbr, split=train_split)
+    raw_datasets["test"] = loading_method(args.dataset_name, args.language_abbr, split=test_split)
     raw_datasets = raw_datasets.cast_column("audio", Audio(sampling_rate=16000))
 
     logger.info("Dataset loaded: %s", raw_datasets)
-    logger.info(f'{raw_datasets["train"][0]}')
+    logger.info(f"{raw_datasets['train'][0]}")
 
     vectorized_datasets = raw_datasets.map(
         prepare_dataset,
@@ -539,9 +539,9 @@ def main():
     )
     model.config.forced_decoder_ids = None
     model.config.suppress_tokens = []
-    if len(set(model.hf_device_map.values()).intersection({"cpu", "disk"})) > 0:
+    if hasattr(model, "hf_device_map") and len(set(model.hf_device_map.values()).intersection({"cpu", "disk"})) > 0:
         raise ValueError("Training on CPU or disk is not supported.")
-    if len(set(model.hf_device_map.values())) > 1:
+    if hasattr(model, "hf_device_map") and len(set(model.hf_device_map.values())) > 1:
         device_map = model.hf_device_map.copy()
         # required because `labels` are on main execution device (0) while the output of `proj_out` is on other device.
         # So, this leads to device mismatch error when calculation cross-entropy between logits and labels.
@@ -566,6 +566,13 @@ def main():
 
         model.model.encoder.conv1.register_forward_hook(make_inputs_require_grad)
 
+        # Calculate total steps first for AdaLoRA
+        if args.max_train_steps is None:
+            num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+            total_steps = args.num_train_epochs * num_update_steps_per_epoch
+        else:
+            total_steps = args.max_train_steps
+
         # wrapping model with adalora tuner
         if args.use_adalora:
             config = AdaLoraConfig(
@@ -580,6 +587,7 @@ def main():
                 lora_dropout=args.lora_dropout,
                 target_modules=["k_proj", "q_proj", "v_proj", "out_proj", "fc1", "fc2"],
                 orth_reg_weight=args.orth_reg_weight,
+                total_step=total_steps,
             )
         else:
             config = LoraConfig(
@@ -619,13 +627,19 @@ def main():
     # Note here that the max steps is adjusted by the accelerator's num_processes
     args.max_train_steps = math.ceil(args.max_train_steps / accelerator.num_processes)
     if args.use_peft and args.use_adalora:
-        model.base_model.peft_config["default"].total_step = args.max_train_steps
-        # model.base_model.peft_config.total_step = args.max_train_steps
+        # Update the total_step in the config to reflect the adjusted max_train_steps
+        # Handle DDP case where model is wrapped
+        if hasattr(model, "module"):
+            # DDP case
+            model.module.base_model.peft_config["default"].total_step = args.max_train_steps
+        else:
+            # Non-DDP case
+            model.base_model.peft_config["default"].total_step = args.max_train_steps
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if args.with_tracking:
-        run_name = f"run-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        run_name = f"run-{datetime.now(UTC).strftime('%Y-%m-%d_%H-%M-%S')}"
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
@@ -682,7 +696,21 @@ def main():
                 # Note that this requires parameter gradients.
                 # Hence being called before optimizer.zero_grad().
                 if args.use_peft and args.use_adalora:
-                    model.update_and_allocate(global_step)
+                    # Handle DDP case where model is wrapped
+                    if hasattr(model, "module"):
+                        # DDP case
+                        peft_model = model.module
+                    else:
+                        # Non-DDP case
+                        peft_model = model
+
+                    # Check if rank_pattern exists before calling update_and_allocate
+                    if (
+                        hasattr(peft_model, "peft_config")
+                        and peft_model.peft_config["default"].rank_pattern is not None
+                        and global_step >= args.tinit  # Only start updating after tinit steps
+                    ):
+                        peft_model.update_and_allocate(global_step)
 
                 optimizer.zero_grad()
                 global_step += 1
@@ -739,14 +767,28 @@ def main():
 
             if accelerator.is_main_process:
                 processor.tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
+                api.upload_folder(
+                    repo_id=repo_id,
+                    folder_path=args.output_dir,
+                    commit_message=f"Training in progress epoch {epoch}",
+                    run_as_future=True,
                 )
 
     if args.load_best_model:
         # load the best model
         accelerator.load_state(os.path.join(args.output_dir, "best_checkpoint"))
-        model.resize_modules_by_rank_pattern(model.peft_config["default"].rank_pattern, "default")
+        # Handle DDP case where model is wrapped
+        if hasattr(model, "module"):
+            # DDP case
+            peft_model = model.module
+        else:
+            # Non-DDP case
+            peft_model = model
+
+        # Only resize if rank_pattern exists
+        if hasattr(peft_model, "peft_config") and peft_model.peft_config["default"].rank_pattern is not None:
+            peft_model.resize_modules_by_rank_pattern(peft_model.peft_config["default"].rank_pattern, "default")
+
         eval_metrics = evaluation_loop(
             model, eval_dataloader, processor, normalizer, metric, forced_decoder_ids, accelerator
         )
@@ -760,7 +802,11 @@ def main():
     if accelerator.is_main_process:
         processor.tokenizer.save_pretrained(args.output_dir)
         if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+            api.upload_folder(
+                repo_id=repo_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+            )
 
     with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
         eval_metrics.pop("eval_samples")

@@ -12,20 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
 
-import torch.nn as nn
+from contextlib import contextmanager
 
-from peft.utils import _freeze_adapter, _get_submodules
+from torch import nn
+
+from peft.utils import _get_submodules
 
 from .config import AdaptionPromptConfig, prepare_config
-from .layer import AdaptedAttention
+from .layer import AdaptedAttention, AdaptedAttentionGPT
 from .utils import is_adaption_prompt_trainable
 
 
 class AdaptionPromptModel(nn.Module):
     """
-    Implements adaption prompts as described in https://arxiv.org/pdf/2303.16199.pdf.
+    Implements adaption prompts as described in https://huggingface.co/papers/2303.16199.
 
     The top L attention modules are replaced with AdaptedAttention modules that wrap the original ones, but insert
     trainable prompts with gates (for zero init).
@@ -40,16 +41,16 @@ class AdaptionPromptModel(nn.Module):
     - Disabling the adapter would also result in the modules being removed from the model.
     """
 
-    def __init__(self, model, configs: Dict, adapter_name: str):
+    def __init__(self, model, configs: dict, adapter_name: str):
         super().__init__()
         self.model = model
         # Store adapter configs by name.
-        self.peft_config: Dict[str, AdaptionPromptConfig] = {}
+        self.peft_config: dict[str, AdaptionPromptConfig] = {}
         # Store lists of the parents of the affected attention modules by adapter name.
         # We keep references to the parents so we can swap the adapters in-and-out of the model.
-        self._parents: Dict[str, List[nn.Module]] = {}
+        self._parents: dict[str, list[nn.Module]] = {}
         # Store lists of cached AdaptedAttention modules by name.
-        self._cached_adapters: Dict[str, List] = {}
+        self._cached_adapters: dict[str, list] = {}
         # The name of the currently active adapter.
         self._active_adapter = None
         # Whether the adapter is enabled.
@@ -66,13 +67,12 @@ class AdaptionPromptModel(nn.Module):
 
         parents = []
         for name, _ in self.model.named_modules():
-            if name.endswith(config.target_modules):
+            if name.endswith(f".{config.target_modules}"):
                 par, _, _ = _get_submodules(self.model, name)
                 parents.append(par)
         if len(parents) < config.adapter_layers:
             raise ValueError(
-                f"Config specifies more adapter layers '{config.adapter_layers}'"
-                f" than the model has '{len(parents)}'."
+                f"Config specifies more adapter layers '{config.adapter_layers}' than the model has '{len(parents)}'."
             )
         # Note that if the target modules are not in Sequential, ModuleList, or
         # some other PyTorch ordered container, the behavior is undefined as we
@@ -81,21 +81,74 @@ class AdaptionPromptModel(nn.Module):
         parents = parents[-config.adapter_layers :]
         self._parents[adapter_name] = parents
 
-        # It is only None during initialization.
-        # If it is disabled, we don't have to remove the modules.
-        if self._active_adapter is not None and self._enabled:
-            self._remove_adapted_attentions(self._active_adapter)
-        self._active_adapter = adapter_name
+        # The new modules are created in place, so the currently active adapter has to be swapped out first.
+        # `_active_adapter` is only None during initialization; if the adapter is disabled, nothing is swapped in.
+        previous_adapter = self._active_adapter
+        if previous_adapter is not None and self._enabled:
+            self._remove_adapted_attentions(previous_adapter)
         self.peft_config[adapter_name] = config
+        self._active_adapter = adapter_name
         self._create_adapted_attentions(config, parents)
-        if not self._enabled:
-            self._remove_adapted_attentions(self._active_adapter)
 
-        if config.inference_mode:
-            _freeze_adapter(self.model, adapter_name)
+        if previous_adapter is None:
+            # the first adapter becomes the active one
+            if not self._enabled:
+                self._remove_adapted_attentions(adapter_name)
+        else:
+            # adding an adapter must not change which adapter is active
+            self._remove_adapted_attentions(adapter_name)
+            self._active_adapter = previous_adapter
+            if self._enabled:
+                self._set_adapted_attentions(previous_adapter)
 
-    def set_adapter(self, adapter_name: str) -> None:
+    def delete_adapter(self, adapter_name: str) -> None:
+        """Delete an adapter with the given name."""
+        if adapter_name not in self.peft_config:
+            raise ValueError(f"Adapter {adapter_name} does not exist")
+
+        if adapter_name == self._active_adapter:
+            remaining_adapters = [name for name in self.peft_config if name != adapter_name]
+            if self._enabled:
+                self._remove_adapted_attentions(adapter_name)
+            self._active_adapter = remaining_adapters[0] if remaining_adapters else None
+            if self._active_adapter is not None and self._enabled:
+                self._set_adapted_attentions(self._active_adapter)
+
+        del self.peft_config[adapter_name]
+        del self._parents[adapter_name]
+        self._cached_adapters.pop(adapter_name, None)
+
+    @contextmanager
+    def _temporarily_active(self, adapter_name: str):
+        """Swap the modules of `adapter_name` into the model for the duration of the context.
+
+        The modules of the inactive adapters are stored in `_cached_adapters` and are thus not part of the model, so
+        they can neither be saved nor loaded while they are cached.
+        """
+        previous_adapter = self._active_adapter
+        was_enabled = self._enabled
+        if not was_enabled:
+            self.enable_adapter_layers()
+        try:
+            self.set_adapter(adapter_name)
+            yield
+        finally:
+            self.set_adapter(previous_adapter)
+            if not was_enabled:
+                self.disable_adapter_layers()
+
+    @property
+    def active_adapters(self) -> list[str]:
+        # without this, the lookup falls through to the wrapped transformers model, whose `active_adapters` refers to
+        # the adapters of the transformers PEFT integration
+        if self._active_adapter is None:
+            return []
+        return [self._active_adapter]
+
+    def set_adapter(self, adapter_name: str, inference_mode: bool = False) -> None:
         """Set the model to use the adapter with the given name."""
+        if inference_mode:
+            raise ValueError("inference_mode is not supported for AdaptionPromptModel.")
         if self._active_adapter == adapter_name:
             return
         if adapter_name not in self.peft_config:
@@ -117,14 +170,27 @@ class AdaptionPromptModel(nn.Module):
         self._enabled = False
         self._remove_adapted_attentions(self._active_adapter)
 
-    def _create_adapted_attentions(self, config: AdaptionPromptConfig, parents: List[nn.Module]) -> None:
+    def _create_adapted_attentions(self, config: AdaptionPromptConfig, parents: list[nn.Module]) -> None:
         """Wrap LlamaAttention modules with newly created AdaptedAttention modules."""
         for par in parents:
-            attn = AdaptedAttention(
-                model_type=self.model.config.model_type,
-                adapter_len=config.adapter_len,
-                model=getattr(par, config.target_modules),
-            )
+            if self.model.config.model_type == "gpt2":
+                attn = AdaptedAttentionGPT(
+                    model_type=self.model.config.model_type,
+                    adapter_len=config.adapter_len,
+                    model=getattr(par, config.target_modules),
+                )
+
+            else:
+                attn = AdaptedAttention(
+                    model_type=self.model.config.model_type,
+                    adapter_len=config.adapter_len,
+                    model=getattr(par, config.target_modules),
+                )
+            if config.inference_mode:
+                # Freeze the new adapter before it can be moved into the inactive cache.
+                for name, param in attn.named_parameters():
+                    if is_adaption_prompt_trainable(name):
+                        param.requires_grad_(False)
             setattr(par, config.target_modules, attn)
 
     def _set_adapted_attentions(self, adapter_name: str) -> None:
@@ -158,4 +224,29 @@ class AdaptionPromptModel(nn.Module):
         except AttributeError:
             # This is necessary as e.g. causal models have various methods that we
             # don't want to re-implement here.
+            if name == "model":  # see #1892: prevent infinite recursion if class is not initialized
+                raise
             return getattr(self.model, name)
+
+    # The following classmethods mirror the state dict serialization hooks of BaseTuner, which AdaptionPromptModel
+    # does not inherit from, see BaseTuner for the documentation.
+
+    @classmethod
+    def _get_adapter_state_dict(cls, model, config, adapter_name, state_dict, unwanted_adapter_names):
+        adaption_prompt_model = getattr(model, "base_model", model)
+        if isinstance(adaption_prompt_model, cls) and adaption_prompt_model._active_adapter != adapter_name:
+            # the weights of an inactive adapter are not part of the passed state_dict, see _temporarily_active
+            with adaption_prompt_model._temporarily_active(adapter_name):
+                state_dict = model.state_dict()
+        return {k: state_dict[k] for k in state_dict if k.split(".")[-1].startswith("adaption_")}
+
+    @classmethod
+    def _remove_adapter_name_from_key(cls, key, adapter_name):
+        from peft.tuners.tuners_utils import _remove_adapter_name_from_state_dict_key
+
+        return _remove_adapter_name_from_state_dict_key(key, adapter_name)
+
+    @classmethod
+    def _remap_adapter_state_dict_for_load(cls, model, config, adapter_name, state_dict):
+        # adaption prompt state dict keys are stored without the adapter name, so there is nothing to remap
+        return state_dict

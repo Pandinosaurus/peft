@@ -12,65 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import os
 import tempfile
-from unittest import TestCase
 
 import pytest
 import torch
-from parameterized import parameterized
 from torch.testing import assert_close
+from transformers import AutoModelForCausalLM
 
-from peft.mapping import get_peft_model
+from peft import get_peft_model
 from peft.peft_model import PeftModel
 from peft.tuners.multitask_prompt_tuning import MultitaskPromptTuningConfig, MultitaskPromptTuningInit
+from peft.utils import infer_device
 from peft.utils.other import WEIGHTS_NAME, prepare_model_for_kbit_training
 from peft.utils.save_and_load import get_peft_model_state_dict
-from tests.testing_common import PeftCommonTester
 
 
-def is_llama_available() -> bool:
-    """Check if Llama is available in the transformers library (it's not in earlier versions)."""
-    try:
-        return importlib.util.find_spec("transformers.models.llama.modeling_llama") is not None
-    except ModuleNotFoundError:
-        return False
+MODELS_TO_TEST = [
+    "peft-internal-testing/tiny-random-LlamaForCausalLM",
+]
 
 
-if is_llama_available():
-    # We guard the import statement so that our unit tests will pass in CI environments
-    # that don't have a transformers package with Llama.
-    from transformers import LlamaConfig, LlamaForCausalLM
-
-
-class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
+class TestMultiTaskPromptTuning:
     """
-    Tests for the AdaptionPrompt model.
-
-    Some of these tests were adapted from `test_peft_model.py` (which has been refactored since), but since we haven't
-    checked in the test checkpoints for Llama into `hf-internal-testing`, we separate them for now.
+    Tests for the MultiTaskPromptTuning model.
     """
 
-    def setUp(self):
-        """Check that llama is available in transformers package before running each test."""
-        if not is_llama_available():
-            self.skipTest("Llama not available in transformers. Skipping test.")
-
-    @staticmethod
-    def _create_test_llama_config():
-        """Create a test config for a small Llama model for testing."""
-        return LlamaConfig(
-            vocab_size=16,
-            hidden_size=8,
-            intermediate_size=8,
-            num_hidden_layers=8,
-            num_attention_heads=4,
-            use_cache=False,
-        )
-
-    @classmethod
-    def _create_multitask_prompt_tuning_config(cls) -> MultitaskPromptTuningConfig:
+    @pytest.fixture
+    def config(cls) -> MultitaskPromptTuningConfig:
         return MultitaskPromptTuningConfig(
             task_type="CAUSAL_LM",
             num_virtual_tokens=50,
@@ -80,9 +49,13 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
             ),
         )
 
-    def test_prepare_for_training(self) -> None:
-        model = LlamaForCausalLM(self._create_test_llama_config())
-        model = get_peft_model(model, self._create_multitask_prompt_tuning_config())
+    transformers_class = AutoModelForCausalLM
+    torch_device = infer_device()
+
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_prepare_for_training(self, model_id, config):
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model = get_peft_model(model, config)
         model = model.to(self.torch_device)
 
         dummy_input = torch.LongTensor([[1, 1, 1]]).to(self.torch_device)
@@ -90,15 +63,16 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
 
         assert not dummy_output.requires_grad
 
-    def test_prepare_for_int8_training(self) -> None:
-        model = LlamaForCausalLM(self._create_test_llama_config())
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_prepare_for_int8_training(self, model_id, config):
+        model = AutoModelForCausalLM.from_pretrained(model_id)
         model = prepare_model_for_kbit_training(model)
         model = model.to(self.torch_device)
 
         for param in model.parameters():
             assert not param.requires_grad
 
-        model = get_peft_model(model, self._create_multitask_prompt_tuning_config())
+        model = get_peft_model(model, config)
 
         # For backward compatibility
         if hasattr(model, "enable_input_require_grads"):
@@ -115,18 +89,19 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
 
         assert dummy_output.requires_grad
 
-    def test_save_pretrained(self) -> None:
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_save_pretrained(self, model_id, config):
         seed = 420
         torch.manual_seed(seed)
-        model = LlamaForCausalLM(self._create_test_llama_config())
-        model = get_peft_model(model, self._create_multitask_prompt_tuning_config())
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model = get_peft_model(model, config)
         model = model.to(self.torch_device)
 
         with tempfile.TemporaryDirectory() as tmp_dirname:
             model.save_pretrained(tmp_dirname)
 
             torch.manual_seed(seed)
-            model_from_pretrained = LlamaForCausalLM(self._create_test_llama_config())
+            model_from_pretrained = AutoModelForCausalLM.from_pretrained(model_id)
             model_from_pretrained = PeftModel.from_pretrained(model_from_pretrained, tmp_dirname)
 
             # check if the state dicts are equal
@@ -158,18 +133,19 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
             # check if `config.json` is not present
             assert not os.path.exists(os.path.join(tmp_dirname, "config.json"))
 
-    def test_save_pretrained_regression(self) -> None:
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_save_pretrained_regression(self, model_id, config):
         seed = 420
         torch.manual_seed(seed)
-        model = LlamaForCausalLM(self._create_test_llama_config())
-        model = get_peft_model(model, self._create_multitask_prompt_tuning_config())
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model = get_peft_model(model, config)
         model = model.to(self.torch_device)
 
         with tempfile.TemporaryDirectory() as tmp_dirname:
             model.save_pretrained(tmp_dirname, safe_serialization=False)
 
             torch.manual_seed(seed)
-            model_from_pretrained = LlamaForCausalLM(self._create_test_llama_config())
+            model_from_pretrained = AutoModelForCausalLM.from_pretrained(model_id)
             model_from_pretrained = PeftModel.from_pretrained(model_from_pretrained, tmp_dirname)
 
             # check if the state dicts are equal
@@ -201,9 +177,10 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
             # check if `config.json` is not present
             assert not os.path.exists(os.path.join(tmp_dirname, "config.json"))
 
-    def test_generate(self) -> None:
-        model = LlamaForCausalLM(self._create_test_llama_config())
-        model = get_peft_model(model, self._create_multitask_prompt_tuning_config())
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_generate(self, model_id, config):
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model = get_peft_model(model, config)
         model = model.to(self.torch_device)
 
         input_ids = torch.LongTensor([[1, 1, 1], [2, 1, 2]]).to(self.torch_device)
@@ -216,14 +193,15 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
         # check if `generate` works if positional arguments are passed
         _ = model.generate(input_ids, attention_mask=attention_mask, task_ids=task_ids)
 
-    def test_use_cache(self) -> None:
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_use_cache(self, model_id, config):
         """Test that MultiTaskPromptTuning works when Llama config use_cache=True."""
         torch.manual_seed(0)
         input_ids = torch.LongTensor([[1, 1, 1], [2, 1, 2]]).to(self.torch_device)
         task_ids = torch.LongTensor([1, 2]).to(self.torch_device)
 
-        original = LlamaForCausalLM(self._create_test_llama_config()).eval()
-        mpt = get_peft_model(original, self._create_multitask_prompt_tuning_config())
+        original = AutoModelForCausalLM.from_pretrained(model_id)
+        mpt = get_peft_model(original, config)
         mpt = mpt.to(self.torch_device)
 
         expected = mpt.generate(input_ids=input_ids, max_length=8, task_ids=task_ids)
@@ -233,24 +211,22 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
         actual = mpt.generate(input_ids=input_ids, max_length=8, task_ids=task_ids)
         assert_close(expected, actual, rtol=0, atol=0)
 
-    def test_bf16_inference(self) -> None:
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_bf16_inference(self, model_id, config):
         """Test that MultiTaskPromptTuning works when Llama using a half-precision model."""
         input_ids = torch.LongTensor([[1, 1, 1], [2, 1, 2]]).to(self.torch_device)
         task_ids = torch.tensor([1, 2]).to(self.torch_device)
 
-        original = LlamaForCausalLM.from_pretrained(
-            "trl-internal-testing/tiny-random-LlamaForCausalLM", torch_dtype=torch.bfloat16
-        )
-        mpt = get_peft_model(original, self._create_multitask_prompt_tuning_config())
+        original = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16)
+        mpt = get_peft_model(original, config)
         mpt = mpt.to(self.torch_device)
         _ = mpt.generate(input_ids=input_ids, task_ids=task_ids)
 
-    def test_generate_text_with_random_init(self) -> None:
-        model = LlamaForCausalLM(self._create_test_llama_config())
-
-        config = self._create_multitask_prompt_tuning_config()
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_generate_text_with_random_init(self, model_id, config) -> None:
+        torch.manual_seed(0)
+        model = AutoModelForCausalLM.from_pretrained(model_id)
         config.prompt_tuning_init = MultitaskPromptTuningInit.RANDOM
-
         model = get_peft_model(model, config)
         model = model.to(self.torch_device)
 
@@ -265,17 +241,27 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
             # check if `generate` raises an error if task_ids are not passed
             _ = model.generate(input_ids, attention_mask=attention_mask)
 
-    @parameterized.expand(
+    @pytest.mark.parametrize(
+        "prompt_tuning_init",
         [
             MultitaskPromptTuningInit.AVERAGE_SOURCE_TASKS,
             MultitaskPromptTuningInit.EXACT_SOURCE_TASK,
             MultitaskPromptTuningInit.ONLY_SOURCE_SHARED,
         ],
     )
-    def test_generate_text_with_other_init(self, prompt_tuning_init) -> None:
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_generate_text_with_other_init(self, prompt_tuning_init, model_id, config) -> None:
+        # This test is flaky, hence fixing the seed. The reason is somehow related to:
+        # https://github.com/huggingface/transformers/blob/e786844425b6b1112c76513d66217ce2fe6aea41/src/transformers/generation/utils.py#L2691
+        # When an EOS token is generated, the loop is exited and the pytest.raises at the bottom is not triggered
+        # because `forward` of the PEFT model, which should raise the error, is never called.
+        # The error case itself is covered robustly by test_forward_without_task_ids_raises below, which does not
+        # depend on the generation loop.
+        torch.manual_seed(42)  # seed 43 fails with transformers v4.42.3 and torch v2.3.1
+
         with tempfile.TemporaryDirectory() as tmp_dirname:
-            model = LlamaForCausalLM(self._create_test_llama_config())
-            model = get_peft_model(model, self._create_multitask_prompt_tuning_config())
+            model = AutoModelForCausalLM.from_pretrained(model_id)
+            model = get_peft_model(model, config)
             model.save_pretrained(tmp_dirname, safe_serialization=False)  # bc torch.load is used
 
             config = MultitaskPromptTuningConfig(
@@ -288,7 +274,7 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
                 prompt_tuning_init=prompt_tuning_init,
                 prompt_tuning_init_state_dict_path=os.path.join(tmp_dirname, WEIGHTS_NAME),
             )
-            model = LlamaForCausalLM(self._create_test_llama_config())
+            model = AutoModelForCausalLM.from_pretrained(model_id)
             model = get_peft_model(model, config)
             model = model.to(self.torch_device)
 
@@ -299,6 +285,49 @@ class MultiTaskPromptTuningTester(TestCase, PeftCommonTester):
             # check if `generate` works
             _ = model.generate(input_ids=input_ids, attention_mask=attention_mask, task_ids=task_ids)
 
-            with pytest.raises(ValueError):
+            with pytest.raises(ValueError, match="task_ids cannot be None"):
                 # check if `generate` raises an error if task_ids are not passed
                 _ = model.generate(input_ids, attention_mask=attention_mask)
+
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_forward_with_task_ids(self, model_id, config):
+        # Check the forward pass directly (not via generate): the prompt embeddings are prepended to the inputs_embeds
+        # and the labels are prefixed with -100, resulting in the standard causal LM loss over the extended sequence.
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model = get_peft_model(model, config)
+        model = model.to(self.torch_device)
+        model.eval()
+
+        input_ids = torch.LongTensor([[1, 1, 1], [2, 1, 2]]).to(self.torch_device)
+        attention_mask = torch.LongTensor([[1, 1, 1], [1, 1, 1]]).to(self.torch_device)
+        task_ids = torch.LongTensor([1, 2]).to(self.torch_device)
+        labels = input_ids.clone()
+
+        with torch.no_grad():
+            output = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, task_ids=task_ids)
+
+        num_virtual_tokens = config.num_virtual_tokens
+        assert output.logits.shape[1] == num_virtual_tokens + input_ids.shape[1]
+        assert torch.isfinite(output.loss)
+
+        prefix_labels = torch.full((2, num_virtual_tokens), -100).to(self.torch_device)
+        extended_labels = torch.cat([prefix_labels, labels], dim=1)
+        vocab_size = output.logits.shape[-1]
+        expected_loss = torch.nn.functional.cross_entropy(
+            output.logits[:, :-1].reshape(-1, vocab_size).float(),
+            extended_labels[:, 1:].reshape(-1),
+            ignore_index=-100,
+        )
+        assert torch.allclose(output.loss, expected_loss, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("model_id", MODELS_TO_TEST)
+    def test_forward_without_task_ids_raises(self, model_id, config):
+        # In contrast to the generate-based checks above, this test does not depend on the generation loop calling the
+        # PEFT forward and is thus robust to changes in transformers' generate.
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model = get_peft_model(model, config)
+        model = model.to(self.torch_device)
+
+        input_ids = torch.LongTensor([[1, 1, 1], [2, 1, 2]]).to(self.torch_device)
+        with pytest.raises(ValueError, match="task_ids cannot be None"):
+            _ = model(input_ids=input_ids)

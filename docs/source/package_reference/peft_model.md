@@ -36,6 +36,9 @@ A `PeftModel` for causal language modeling.
 
 A `PeftModel` for sequence-to-sequence language modeling.
 
+Note: this will automatically generate decoder input tokens by shifting the input tokens one step right using
+[`shift_tokens_right`] if you supply input tokens but don't supply decoder input tokens explicitly.
+
 [[autodoc]] PeftModelForSeq2SeqLM
     - all
 
@@ -71,3 +74,7 @@ A `PeftModel` for mixing different adapter types (e.g. LoRA and LoHa).
 [[autodoc]] utils.get_peft_model_state_dict
 
 [[autodoc]] utils.prepare_model_for_kbit_training
+
+[[autodoc]] get_layer_status
+
+[[autodoc]] get_model_status

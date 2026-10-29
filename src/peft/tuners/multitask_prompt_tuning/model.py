@@ -16,11 +16,12 @@ import torch
 
 from peft.tuners.prompt_tuning import PromptEmbedding
 from peft.utils import TaskType
+from peft.utils.save_and_load import torch_load
 
 from .config import MultitaskPromptTuningConfig, MultitaskPromptTuningInit
 
 
-# This code is adapted for the paper: https://arxiv.org/abs/2303.02861 and
+# This code is adapted for the paper: https://huggingface.co/papers/2303.02861 and
 # constitutes the work done at MIT-IBM Watson Research Lab.
 
 
@@ -66,11 +67,15 @@ class MultitaskPromptEmbedding(PromptEmbedding):
                     "init method"
                 )
 
-            # TODO: There should be an option for safetensors
-            state_dict: dict = torch.load(
-                config.prompt_tuning_init_state_dict_path,
-                map_location=word_embeddings.weight.device,
-            )
+            if config.prompt_tuning_init_state_dict_path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+
+                state_dict: dict = load_file(config.prompt_tuning_init_state_dict_path)
+            else:
+                state_dict: dict = torch_load(
+                    config.prompt_tuning_init_state_dict_path,
+                    map_location=word_embeddings.weight.device,
+                )
 
         if config.prompt_tuning_init in [
             MultitaskPromptTuningInit.AVERAGE_SOURCE_TASKS,
@@ -113,3 +118,18 @@ class MultitaskPromptEmbedding(PromptEmbedding):
         prompt_embeddings *= task_prompts
 
         return prompt_embeddings
+
+    @classmethod
+    def _get_adapter_state_dict(cls, model, config, adapter_name, state_dict, unwanted_adapter_names):
+        prompt_encoder = model.prompt_encoder[adapter_name]
+        return {
+            "prefix_task_cols": prompt_encoder.prefix_task_cols,
+            "prefix_task_rows": prompt_encoder.prefix_task_rows,
+            "prompt_embeddings": prompt_encoder.embedding.weight,
+        }
+
+    def _load_adapter_state_dict(self, state_dict):
+        super()._load_adapter_state_dict(state_dict)
+        # additionally load prefix_task_cols and prefix_task_rows; not strict because the "prompt_embeddings" entry
+        # does not correspond to a parameter of this module
+        self.load_state_dict(state_dict, strict=False)

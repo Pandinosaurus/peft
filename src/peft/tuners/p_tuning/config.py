@@ -20,7 +20,7 @@ from peft.config import PromptLearningConfig
 from peft.utils import PeftType
 
 
-class PromptEncoderReparameterizationType(str, enum.Enum):
+class PromptEncoderReparameterizationType(str, enum.Enum):  # noqa: UP042
     MLP = "MLP"
     LSTM = "LSTM"
 
@@ -56,4 +56,5 @@ class PromptEncoderConfig(PromptLearningConfig):
     )
 
     def __post_init__(self):
+        super().__post_init__()
         self.peft_type = PeftType.P_TUNING

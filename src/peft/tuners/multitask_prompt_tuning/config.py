@@ -20,7 +20,7 @@ from peft.tuners.prompt_tuning import PromptTuningConfig
 from peft.utils import PeftType
 
 
-class MultitaskPromptTuningInit(str, enum.Enum):
+class MultitaskPromptTuningInit(str, enum.Enum):  # noqa: UP042
     # initialize prompt with text
     TEXT = "TEXT"
     # initialize prompt with random matrix
@@ -58,4 +58,5 @@ class MultitaskPromptTuningConfig(PromptTuningConfig):
     num_tasks: Optional[int] = field(default=1, metadata={"help": "number of tasks"})
 
     def __post_init__(self):
+        super().__post_init__()
         self.peft_type = PeftType.MULTITASK_PROMPT_TUNING

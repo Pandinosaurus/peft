@@ -16,7 +16,7 @@ rendered properly in your Markdown viewer.
 
 # Adapter injection
 
-With PEFT, you can inject trainable adapters into any `torch` module which allows you to use adapter methods without relying on the modeling classes in PEFT. Currently, PEFT supports injecting [LoRA](../conceptual_guides/adapter#low-rank-adaptation-lora), [AdaLoRA](../conceptual_guides/adapter#adaptive-low-rank-adaptation-adalora), and [IA3](../conceptual_guides/ia3) into models because for these adapters, inplace modification of the model is sufficient for finetuning it.
+With PEFT, you can inject trainable adapters into any `torch` module which allows you to use adapter methods without relying on the modeling classes in PEFT. This works for all adapters except for those based on prompt learning (e.g. prefix tuning or p-tuning) and adapters that keep state shared between multiple target layers.
 
 Check the table below to see when you should inject adapters.
 
@@ -24,6 +24,11 @@ Check the table below to see when you should inject adapters.
 |---|---|
 | the model is modified inplace, keeping all the original attributes and methods | manually write the `from_pretrained` and `save_pretrained` utility functions from Hugging Face to save and load adapters |
 | works for any `torch` module and modality | doesn't work with any of the utility methods provided by `PeftModel` such as disabling and merging adapters |
+
+> [!WARNING]
+> `inject_adapter_in_model` does not support PEFT methods that keep adapter state shared between multiple target layers. This currently includes TinyLoRA, UniLoRA, VeRA, PVeRA, VBLoRA, and FRoD. Use [`get_peft_model`] for these methods instead.
+
+## Creating a new PEFT model
 
 To perform the adapter injection, use the [`inject_adapter_in_model`] method. This method takes 3 arguments, the PEFT config, the model, and an optional adapter name. You can also attach multiple adapters to the model if you call [`inject_adapter_in_model`] multiple times with different adapter names.
 
@@ -85,6 +90,30 @@ DummyModel(
 )
 ```
 
+### Injection based on a `state_dict`
+
+Sometimes, it is possible that there is a PEFT adapter checkpoint but the corresponding PEFT config is not known for whatever reason. To inject the PEFT layers for this checkpoint, you would usually have to reverse-engineer the corresponding PEFT config, most notably the `target_modules` argument, based on the `state_dict` from the checkpoint. This can be cumbersome and error prone. To avoid this, it is also possible to call [`inject_adapter_in_model`] and pass the loaded `state_dict` as an argument:
+
+```python
+from safetensors.torch import load_file
+
+model = ...
+state_dict = load_file(<path-to-safetensors-file>)
+lora_config = LoraConfig(...)
+model = inject_adapter_in_model(lora_config, model, state_dict=state_dict)
+```
+
+In this case, PEFT will use the `state_dict` as reference for which layers to target instead of using the PEFT config. As a user, you don't have to set the exact `target_modules` of the PEFT config for this to work. However, you should still pass a PEFT config of the right type, in this example `LoraConfig`, you can leave the `target_modules` as `None`.
+
+Be aware that this still only creates the uninitialized PEFT layers, the values from the `state_dict` are not used to populate the model weights. To populate the weights, proceed with calling [`set_peft_model_state_dict`] as described below.
+
+⚠️ Note that if there is a mismatch between what is configured in the PEFT config and what is found in the `state_dict`, PEFT will warn you about this. You can ignore the warning if you know that the PEFT config is not correctly specified.
+
+> [!WARNING]
+> If the original PEFT adapters was using `target_parameters` instead of `target_modules`, injecting from a `state_dict` will not work correctly. In this case, it is mandatory to use the correct PEFT config for injection.
+
+## Saving the model
+
 To only save the adapter, use the [`get_peft_model_state_dict`] function:
 
 ```python
@@ -95,3 +124,56 @@ print(peft_state_dict)
 ```
 
 Otherwise, `model.state_dict()` returns the full state dict of the model.
+
+## Loading the model
+
+After loading the saved `state_dict`, it can be applied using the [`set_peft_model_state_dict`] function:
+
+```python
+from peft import set_peft_model_state_dict
+
+model = DummyModel()
+model = inject_adapter_in_model(lora_config, model)
+outcome = set_peft_model_state_dict(model, peft_state_dict)
+# check that there were no wrong keys
+print(outcome.unexpected_keys)
+```
+
+If injecting the adapter is slow or you need to load a large number of adapters, you may use an optimization that allows to create an "empty" adapter on meta device and only fills the weights with real weights when the [`set_peft_model_state_dict`] is called. To do this, pass `low_cpu_mem_usage=True` to both [`inject_adapter_in_model`] and [`set_peft_model_state_dict`].
+
+```python
+model = DummyModel()
+model = inject_adapter_in_model(lora_config, model, low_cpu_mem_usage=True)
+
+print(model.linear.lora_A["default"].weight.device.type == "meta")  # should be True
+set_peft_model_state_dict(model, peft_state_dict, low_cpu_mem_usage=True)
+print(model.linear.lora_A["default"].weight.device.type == "cpu")  # should be True
+```
+
+For loading weights from the hub there's the low-level [`load_peft_weights`] function:
+
+```python
+state_dict = load_peft_weights("my-account/my-adapter-repo")
+```
+
+## Setting and loading base weights
+
+The functions above deal with the state dict of the *adapter*. There are also situations where the *base model* weights need to be read or written through the PEFT wrapper. This is not entirely trivial because PEFT renames the parameters of targeted modules (e.g. `q_proj.weight` becomes `q_proj.base_layer.weight`) and adds adapter parameters that don't exist in the base model. Use [`get_base_model_state_dict`] and [`set_base_model_state_dict`] to translate between the two namings:
+
+```python
+from peft import LoraConfig, get_peft_model, get_base_model_state_dict, set_base_model_state_dict
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
+model = get_peft_model(model, LoraConfig(target_modules="all-linear"))
+
+# state dict with the original (pre-PEFT) key names, adapter parameters excluded
+base_state_dict = get_base_model_state_dict(model)
+
+# load a state dict with original key names into the PEFT-wrapped model
+outcome = set_base_model_state_dict(model, base_state_dict, strict=False)
+# check that there were no wrong keys
+print(outcome.missing_keys, outcome.unexpected_keys)
+```
+
+The main use case for this is loading the base weights *after* the model has already been wrapped by PEFT. For example, FSDP training setups such as TorchTitan initialize the model on the meta device, apply PEFT, and shard the result. Real memory only exists after sharding, so the checkpoint, whose keys use the original names, has to be loaded into the already-wrapped model. Note that [`get_base_model_state_dict`] returns the live tensors of the model, not copies.
